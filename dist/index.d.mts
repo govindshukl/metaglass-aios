@@ -245,7 +245,7 @@ type NotificationType = 'info' | 'success' | 'warning' | 'error';
 /**
  * Conversation execution status
  */
-type ConversationStatus = 'idle' | 'running' | 'waiting_for_user' | 'paused' | 'completed' | 'timeout' | 'failed' | 'cancelled';
+type ConversationStatus = 'idle' | 'running' | 'waiting_for_user' | 'completed' | 'timeout' | 'failed' | 'cancelled';
 /**
  * Result from conversation execution
  */
@@ -264,23 +264,18 @@ interface ConversationResult {
     durationMs: number;
     /** Message history */
     messages: Message[];
-    /** Reason for pause (if status is 'paused') */
-    pauseReason?: string;
-    /** Data associated with pause (tool-specific) */
-    pauseData?: unknown;
 }
 /**
  * Sub-agent types
  *
  * Primary types (lowercase):
  * - explore: Read-only exploration and search
- * - contract: Smart Contract generation for goals
- * - execute: Full capability execution within a contract
+ * - execute: Full capability execution
  *
  * Legacy types (for backward compatibility):
- * - Explore, Plan, contract-plan, general-purpose
+ * - Explore, Plan, general-purpose
  */
-type SubAgentType = 'explore' | 'contract' | 'execute' | 'Bash' | 'Skill' | 'Explore' | 'Plan' | 'contract-plan' | 'general-purpose';
+type SubAgentType = 'explore' | 'execute' | 'Bash' | 'Skill' | 'Explore' | 'Plan' | 'general-purpose';
 /**
  * Model selection for sub-agents
  */
@@ -470,28 +465,6 @@ interface AIOSEvents {
     };
     'plan:updated': {
         content: string;
-    };
-    'contract:pending-approval': {
-        conversationId: string;
-        goalId: string;
-        contractPath: string;
-    };
-    'contract:approved': {
-        goalId: string;
-        contractPath: string;
-    };
-    'contract:changes-requested': {
-        goalId: string;
-        feedback: string;
-    };
-    'contract:rejected': {
-        goalId: string;
-        reason?: string;
-    };
-    'conversation:paused': {
-        conversationId: string;
-        reason: string;
-        data?: unknown;
     };
     'conversation:timeout': {
         conversationId: string;
@@ -1347,7 +1320,7 @@ interface CheckpointConfig {
  * Phase tags for trace entries.
  * Every entry belongs to exactly one phase.
  */
-type TracePhase = 'init' | 'classification' | 'turn-start' | 'llm-request' | 'llm-response' | 'todowrite-gate' | 'tool-exec' | 'tool-special' | 'error' | 'turn-end' | 'pause' | 'resume' | 'completion' | 'termination';
+type TracePhase = 'init' | 'classification' | 'turn-start' | 'llm-request' | 'llm-response' | 'todowrite-gate' | 'tool-exec' | 'tool-special' | 'error' | 'turn-end' | 'completion' | 'termination';
 /**
  * A single trace entry (one line in the JSONL file)
  */
@@ -1562,51 +1535,8 @@ interface ConversationConfig {
     retry?: RetryConfig$1;
     /** Checkpoint configuration for "shall I proceed?" pattern */
     checkpoint?: CheckpointConfig;
-    /** Goal context for this conversation */
-    goalId?: string;
-    /** Goal name (for display) */
-    goalName?: string;
-    /** Whether to save conversation session to goal memory on completion */
-    saveToGoalMemory?: boolean;
     /** Tool patterns to restrict available tools for this conversation (e.g., ['vault_create_note', 'agent_ask_user']) */
     toolPatterns?: string[];
-    /** Callback invoked when goal session starts */
-    onSessionStart?: (context: GoalSessionStartContext) => void | Promise<void>;
-    /** Callback invoked when goal session completes */
-    onSessionComplete?: (context: GoalSessionCompleteContext) => void | Promise<void>;
-}
-/**
- * Context passed to onSessionStart callback
- */
-interface GoalSessionStartContext {
-    goalId: string;
-    goalName: string;
-    conversationId: string;
-    timestamp: number;
-}
-/**
- * Context passed to onSessionComplete callback
- */
-interface GoalSessionCompleteContext {
-    goalId: string;
-    goalName: string;
-    conversationId: string;
-    success: boolean;
-    cancelled?: boolean;
-    result?: string;
-    error?: string;
-    turns: number;
-    durationMs: number;
-    summary: GoalSessionSummary;
-}
-/**
- * Summary of the goal session
- */
-interface GoalSessionSummary {
-    toolsExecuted: string[];
-    outputPaths: string[];
-    tasksCreated: number;
-    tasksCompleted: number;
 }
 /**
  * Dependencies for ConversationEngine
@@ -1666,10 +1596,6 @@ declare class ConversationEngine {
      */
     execute(prompt: string, config?: ConversationConfig): Promise<ConversationResult>;
     /**
-     * Emit goal session completed event and call callback
-     */
-    private emitGoalSessionCompleted;
-    /**
      * Cancel the current conversation
      */
     cancel(): void;
@@ -1677,10 +1603,6 @@ declare class ConversationEngine {
      * Check if conversation is running
      */
     isRunning(): boolean;
-    /**
-     * Check if conversation is paused (waiting for contract approval)
-     */
-    isPaused(): boolean;
     /**
      * Get current conversation status
      */
@@ -1693,20 +1615,6 @@ declare class ConversationEngine {
      * Get decision log summary as a string
      */
     getDecisionSummary(): string;
-    /**
-     * Resume conversation after contract approval.
-     * Adds approval confirmation to history and continues execution.
-     */
-    resumeWithApproval(contractPath: string): Promise<ConversationResult>;
-    /**
-     * Resume conversation with requested changes to the contract.
-     * Adds feedback to history and allows agent to revise.
-     */
-    resumeWithChanges(feedback: string): Promise<ConversationResult>;
-    /**
-     * Reject the contract and end the conversation.
-     */
-    rejectContract(reason?: string): Promise<ConversationResult>;
     /**
      * Main conversation loop
      */
@@ -1724,20 +1632,11 @@ declare class ConversationEngine {
      */
     private handleTodoWrite;
     /**
-     * Handle submit_contract tool
-     *
-     * Submits a contract for user approval. This pauses the conversation
-     * until the user approves, requests changes, or rejects.
-     */
-    private handleSubmitContract;
-    /**
      * Handle batch_tools meta-tool
      *
      * Executes multiple tool calls from a single LLM response.
      * This allows models that can't natively produce parallel tool calls
      * to still execute multiple tools per turn.
-     *
-     * Pause tools (submit_contract) are deferred to execute last.
      */
     private handleBatchTools;
     /**
@@ -1768,10 +1667,6 @@ declare class ConversationEngine {
      * Generate a unique conversation ID
      */
     private generateId;
-    /**
-     * Save conversation session to goal memory
-     */
-    private saveGoalSession;
     /**
      * Save current conversation state as a checkpoint
      *
@@ -2678,48 +2573,6 @@ declare class VercelAILLMProvider {
 declare function createDefaultLLMProvider(): VercelAILLMProvider;
 
 /**
- * GoalContextProvider - Stub implementation for AIOS
- *
- * This is a minimal stub that provides the interface expected by ConversationEngine.
- * In Metaglass, this is replaced with a full implementation that connects to the goal system.
- *
- * For standalone AIOS usage, goals are optional - this stub returns no-ops.
- */
-/**
- * GoalContextProvider class
- *
- * Provides a minimal implementation that can be overridden by integrators.
- */
-declare class GoalContextProviderImpl {
-    private context;
-    /**
-     * Set the active goal for context
-     */
-    setActiveGoal(goalId: string, goalName: string): void;
-    /**
-     * Clear the active goal
-     */
-    clearActiveGoal(): void;
-    /**
-     * Check if there's an active goal
-     */
-    hasActiveGoal(): boolean;
-    /**
-     * Get the current active goal ID
-     */
-    getActiveGoalId(): string | null;
-    /**
-     * Get the current active goal name
-     */
-    getActiveGoalName(): string | null;
-    /**
-     * Get context for the current goal (stub - returns empty)
-     */
-    getGoalContext(): Promise<string>;
-}
-declare const goalContextProvider: GoalContextProviderImpl;
-
-/**
  * AIOS Service
  *
  * Main entry point for the AI Operating System.
@@ -2833,10 +2686,6 @@ declare class AIOSService {
     approvePlan(): void;
     rejectPlan(): void;
     onPlanChange(callback: (state: PlanState) => void): () => void;
-    isPaused(): boolean;
-    resumeWithApproval(contractPath: string): Promise<ConversationResult>;
-    resumeWithChanges(feedback: string): Promise<ConversationResult>;
-    rejectContract(reason?: string): Promise<ConversationResult>;
     spawnTask(params: TaskParams): Promise<TaskResult>;
     isTaskRunning(taskId: string): boolean;
     cancelTask(taskId: string): void;
@@ -2948,4 +2797,4 @@ declare function mkdir(path: string, options?: {
 }): Promise<void>;
 declare function exists(path: string): Promise<boolean>;
 
-export { type AIOSBackend, type AIOSConfig, type AIOSEvents, type AIOSFilesystem, type AIOSProviders, AIOSService, type Agent, type AgentConfig, type AgentFactory, type ChatOptions, type ClassificationResult, type CompositeToolProvider, type CompressionConfig, ContextCompressor, type ConversationConfig, ConversationEngine, type ConversationEngineDeps, type ConversationResult, type ConversationStatus, ConversationStore, type CostLevel, type DebugConsoleAPI, DebugHarness, type DecisionLog, DecisionLogger, type DecisionType, type EventEmitter, type EventHandler, type EventSubscription, type GoalSessionCompleteContext, type GoalSessionStartContext, type GoalSessionSummary, type IntentClassificationResult, type IntentSuggestedAction, type InteractionRequest, type JSONSchemaProperty, type KernelLLMClassifyFn, type LLMCapabilities, type LLMProvider, type LLMProviderFactory, type LLMResponse, type LogLevel, type Logger, type MemoryContext, type Message, type MessageRole, type MetadataCategory, type ModelProvider, type ModelTier, type NamespacedStateStore, type NotificationType, type PlanApprovalStatus, PlanManager, type PlanState, type ProviderType, type Question, type QuestionOption, type ReflectionResultPayload, type RetryConfig$1 as RetryConfig, type RetryOptions, type RetryResult, type SideEffects, type StateChangeCallback, type StateStore, type StateSubscription, type StructuredToolResult, type SubAgentType, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, type TaskComplexityLevel, type TaskParams, type TaskResult, TaskSpawner, type Todo$1 as Todo, type TodoChangeCallback, TodoManager, type TodoResult, type TodoStatus$1 as TodoStatus, type Tool, type ToolCall$1 as ToolCall, type ToolCategory, type ToolContext, type ToolDefinition, type ToolFollowUpAction, type ToolMetadata, type ToolParameters, type ToolProvider, type ToolRegistry, type ToolRegistryProvider, type ToolResult$1 as ToolResult, ToolRetryPolicy, type ToolUserInterface, type TraceEntry, type TraceIndex, type TracePhase, type UserInterface, type UserInterfaceFactory, VercelAILLMProvider, type VercelAILLMProviderConfig, VerificationEngine, absorbPendingConfig, canSkipTodoWrite, classifyIntent, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getTodoWriteGuidance, getToolMetadata, goalContextProvider, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, needsClarification, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
+export { type AIOSBackend, type AIOSConfig, type AIOSEvents, type AIOSFilesystem, type AIOSProviders, AIOSService, type Agent, type AgentConfig, type AgentFactory, type ChatOptions, type ClassificationResult, type CompositeToolProvider, type CompressionConfig, ContextCompressor, type ConversationConfig, ConversationEngine, type ConversationEngineDeps, type ConversationResult, type ConversationStatus, ConversationStore, type CostLevel, type DebugConsoleAPI, DebugHarness, type DecisionLog, DecisionLogger, type DecisionType, type EventEmitter, type EventHandler, type EventSubscription, type IntentClassificationResult, type IntentSuggestedAction, type InteractionRequest, type JSONSchemaProperty, type KernelLLMClassifyFn, type LLMCapabilities, type LLMProvider, type LLMProviderFactory, type LLMResponse, type LogLevel, type Logger, type MemoryContext, type Message, type MessageRole, type MetadataCategory, type ModelProvider, type ModelTier, type NamespacedStateStore, type NotificationType, type PlanApprovalStatus, PlanManager, type PlanState, type ProviderType, type Question, type QuestionOption, type ReflectionResultPayload, type RetryConfig$1 as RetryConfig, type RetryOptions, type RetryResult, type SideEffects, type StateChangeCallback, type StateStore, type StateSubscription, type StructuredToolResult, type SubAgentType, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, type TaskComplexityLevel, type TaskParams, type TaskResult, TaskSpawner, type Todo$1 as Todo, type TodoChangeCallback, TodoManager, type TodoResult, type TodoStatus$1 as TodoStatus, type Tool, type ToolCall$1 as ToolCall, type ToolCategory, type ToolContext, type ToolDefinition, type ToolFollowUpAction, type ToolMetadata, type ToolParameters, type ToolProvider, type ToolRegistry, type ToolRegistryProvider, type ToolResult$1 as ToolResult, ToolRetryPolicy, type ToolUserInterface, type TraceEntry, type TraceIndex, type TracePhase, type UserInterface, type UserInterfaceFactory, VercelAILLMProvider, type VercelAILLMProviderConfig, VerificationEngine, absorbPendingConfig, canSkipTodoWrite, classifyIntent, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getTodoWriteGuidance, getToolMetadata, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, needsClarification, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };

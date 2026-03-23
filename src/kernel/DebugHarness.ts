@@ -31,11 +31,9 @@ export type TracePhase =
   | 'llm-response'      // LLM content + toolCalls received
   | 'todowrite-gate'    // Enforcement: has plan? exempt? blocked?
   | 'tool-exec'         // Per-tool: name, params, result
-  | 'tool-special'      // TodoWrite, AskUserQuestion, submit_contract
+  | 'tool-special'      // TodoWrite, AskUserQuestion
   | 'error'             // Caught exception, retry decision, fallback
   | 'turn-end'          // Turn summary, checkpoint
-  | 'pause'             // Conversation paused (contract approval)
-  | 'resume'            // Resumed after approval/changes/rejection
   | 'completion'        // Natural stop, goal session save
   | 'termination'       // Timeout, cancellation, max-turns
   ;

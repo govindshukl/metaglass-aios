@@ -31,12 +31,6 @@ export const TODOWRITE_EXEMPT_TOOLS: readonly string[] = [
   'AskUserQuestion', // Claude Code alias
 
   // ==========================================================================
-  // CONTRACT SUBMISSION
-  // Allowed before TodoWrite (pauses for user approval)
-  // ==========================================================================
-  'submit_contract',
-
-  // ==========================================================================
   // SEARCH TOOLS
   // Full-text, vector, and hybrid search - read-only
   // ==========================================================================

@@ -69,11 +69,6 @@ const AGENT_TYPE_CONFIGS: Record<SubAgentType, AgentTypeConfig> = {
     allowedTools: ['Read', 'Glob', 'Grep', 'LS'],
     systemPromptSuffix: 'You are a fast exploration agent. Only use read-only tools.',
   },
-  contract: {
-    defaultModel: 'sonnet',
-    allowedTools: ['Read', 'Glob', 'Grep', 'agent_ask_user', 'vault_create_note', 'submit_contract'],
-    systemPromptSuffix: 'You are a contract planning agent. Generate Smart Contracts for goals.',
-  },
   execute: {
     defaultModel: 'sonnet',
     allowedTools: '*',
@@ -94,11 +89,6 @@ const AGENT_TYPE_CONFIGS: Record<SubAgentType, AgentTypeConfig> = {
     defaultModel: 'sonnet',
     allowedTools: ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch'],
     systemPromptSuffix: 'You are a planning agent. Design implementation strategies.',
-  },
-  'contract-plan': {
-    defaultModel: 'sonnet',
-    allowedTools: ['Read', 'Glob', 'Grep', 'agent_ask_user', 'vault_create_note', 'submit_contract'],
-    systemPromptSuffix: 'You are a contract planning agent. Generate Smart Contracts for goals.',
   },
   Bash: {
     defaultModel: 'sonnet',

@@ -13,9 +13,6 @@ export { ConversationEngine } from './kernel/ConversationEngine';
 export type {
   ConversationConfig,
   ConversationEngineDeps,
-  GoalSessionStartContext,
-  GoalSessionCompleteContext,
-  GoalSessionSummary,
 } from './kernel/ConversationEngine';
 
 export { TodoManager } from './kernel/TodoManager';
@@ -97,8 +94,6 @@ export type {
   ToolRegistryProvider,
   ProviderType,
 } from './providers/VercelAILLMProvider';
-
-export { goalContextProvider } from './providers/GoalContextProvider';
 
 // =============================================================================
 // SERVICE - High-level orchestration

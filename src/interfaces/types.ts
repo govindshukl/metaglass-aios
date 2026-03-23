@@ -301,7 +301,6 @@ export type ConversationStatus =
   | 'idle'
   | 'running'
   | 'waiting_for_user'
-  | 'paused'      // Waiting for external action (contract approval, etc.)
   | 'completed'
   | 'timeout'     // Max turns reached
   | 'failed'
@@ -325,10 +324,6 @@ export interface ConversationResult {
   durationMs: number;
   /** Message history */
   messages: Message[];
-  /** Reason for pause (if status is 'paused') */
-  pauseReason?: string;
-  /** Data associated with pause (tool-specific) */
-  pauseData?: unknown;
 }
 
 // =============================================================================
@@ -340,22 +335,19 @@ export interface ConversationResult {
  *
  * Primary types (lowercase):
  * - explore: Read-only exploration and search
- * - contract: Smart Contract generation for goals
- * - execute: Full capability execution within a contract
+ * - execute: Full capability execution
  *
  * Legacy types (for backward compatibility):
- * - Explore, Plan, contract-plan, general-purpose
+ * - Explore, Plan, general-purpose
  */
 export type SubAgentType =
   | 'explore'           // Fast, read-only exploration
-  | 'contract'          // Smart Contract generation for goals
   | 'execute'           // Full capability execution
   | 'Bash'              // Command execution
   | 'Skill'             // Declarative workflow execution
   // Legacy aliases for backward compatibility
   | 'Explore'
   | 'Plan'
-  | 'contract-plan'
   | 'general-purpose';
 
 /**
@@ -548,14 +540,7 @@ export interface AIOSEvents {
   'plan:exited': { approved: boolean; content?: string };
   'plan:updated': { content: string };
 
-  // Contract approval events
-  'contract:pending-approval': { conversationId: string; goalId: string; contractPath: string };
-  'contract:approved': { goalId: string; contractPath: string };
-  'contract:changes-requested': { goalId: string; feedback: string };
-  'contract:rejected': { goalId: string; reason?: string };
-
   // Conversation state events
-  'conversation:paused': { conversationId: string; reason: string; data?: unknown };
   'conversation:timeout': { conversationId: string };
 
   // Task events

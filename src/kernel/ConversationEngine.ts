@@ -30,18 +30,10 @@ import { DecisionLogger, type DecisionLog } from './DecisionLogger';
 import { getToolMetadata } from './ToolMetadataRegistry';
 import { type CheckpointConfig } from './CheckpointManager';
 import { getTodoWriteGuidance } from './TodoWriteGuidance';
-import { goalContextProvider } from '../providers/GoalContextProvider';
-import { invoke } from '../backend';
 import type { DebugHarness } from './DebugHarness';
 
 const log = createLogger('ConversationEngine');
 
-// =============================================================================
-// PAUSE TOOLS - These tools trigger full conversation pause requiring manual resume
-// =============================================================================
-// Only submit_contract pauses the conversation for user approval.
-// agent_ask_user and agent_confirm block within the turn but continue afterward.
-const PAUSE_TOOLS = new Set(['submit_contract']);
 
 // =============================================================================
 // CONFIGURATION
@@ -69,60 +61,14 @@ export interface ConversationConfig {
   retry?: RetryConfig;
   /** Checkpoint configuration for "shall I proceed?" pattern */
   checkpoint?: CheckpointConfig;
-  /** Goal context for this conversation */
-  goalId?: string;
-  /** Goal name (for display) */
-  goalName?: string;
-  /** Whether to save conversation session to goal memory on completion */
-  saveToGoalMemory?: boolean;
   /** Tool patterns to restrict available tools for this conversation (e.g., ['vault_create_note', 'agent_ask_user']) */
   toolPatterns?: string[];
-  /** Callback invoked when goal session starts */
-  onSessionStart?: (context: GoalSessionStartContext) => void | Promise<void>;
-  /** Callback invoked when goal session completes */
-  onSessionComplete?: (context: GoalSessionCompleteContext) => void | Promise<void>;
-}
-
-/**
- * Context passed to onSessionStart callback
- */
-export interface GoalSessionStartContext {
-  goalId: string;
-  goalName: string;
-  conversationId: string;
-  timestamp: number;
-}
-
-/**
- * Context passed to onSessionComplete callback
- */
-export interface GoalSessionCompleteContext {
-  goalId: string;
-  goalName: string;
-  conversationId: string;
-  success: boolean;
-  cancelled?: boolean;
-  result?: string;
-  error?: string;
-  turns: number;
-  durationMs: number;
-  summary: GoalSessionSummary;
-}
-
-/**
- * Summary of the goal session
- */
-export interface GoalSessionSummary {
-  toolsExecuted: string[];
-  outputPaths: string[];
-  tasksCreated: number;
-  tasksCompleted: number;
 }
 
 /**
  * Default configuration values
  */
-const DEFAULT_CONFIG: Required<Omit<ConversationConfig, 'signal' | 'systemPrompt' | 'compression' | 'retry' | 'checkpoint' | 'goalId' | 'goalName' | 'saveToGoalMemory' | 'onSessionStart' | 'onSessionComplete' | 'toolPatterns'>> = {
+const DEFAULT_CONFIG: Required<Omit<ConversationConfig, 'signal' | 'systemPrompt' | 'compression' | 'retry' | 'checkpoint' | 'toolPatterns'>> = {
   maxTurns: 50,
   timeoutMs: 600000, // 10 minutes (increased from 5 min to handle slow LLM responses)
   maxTokensPerTurn: 4096,
@@ -201,7 +147,7 @@ export class ConversationEngine {
   private hasProducedOutput: boolean = false;
 
   // Store last config for resume functionality
-  private lastConfig: { maxTurns: number; timeoutMs: number; maxTokensPerTurn: number; requireTodoWrite: boolean; systemPrompt?: string; signal?: AbortSignal; saveToGoalMemory?: boolean; goalId?: string; compression?: CompressionConfig } | null = null;
+  private lastConfig: { maxTurns: number; timeoutMs: number; maxTokensPerTurn: number; requireTodoWrite: boolean; systemPrompt?: string; signal?: AbortSignal; compression?: CompressionConfig } | null = null;
 
   // Debug harness (optional — zero overhead when not attached)
   private debugHarness: DebugHarness | null = null;
@@ -277,9 +223,6 @@ export class ConversationEngine {
       // These don't have defaults in DEFAULT_CONFIG
       systemPrompt: config?.systemPrompt,
       signal: config?.signal,
-      // Additional fields for resume
-      saveToGoalMemory: config?.saveToGoalMemory,
-      goalId: config?.goalId,
       compression: config?.compression,
     };
     log.info('Merged config', { maxTurns: cfg.maxTurns, timeoutMs: cfg.timeoutMs, requireTodoWrite: cfg.requireTodoWrite });
@@ -308,47 +251,7 @@ export class ConversationEngine {
       prompt: prompt,
       config: { maxTurns: cfg.maxTurns, timeoutMs: cfg.timeoutMs, requireTodoWrite: cfg.requireTodoWrite },
       hasSystemPrompt: !!cfg.systemPrompt,
-      hasGoalId: !!config?.goalId,
-      goalId: config?.goalId,
     });
-
-    // Activate goal context if provided
-    if (config?.goalId) {
-      goalContextProvider.setActiveGoal(config.goalId, config.goalName || 'Active Goal');
-      log.info('Activated goal context', { goalId: config.goalId, goalName: config.goalName });
-
-      // Emit goal activation event (using type assertion for custom events)
-      await (this.events as unknown as { emit(event: string, data: unknown): Promise<void> }).emit(
-        'conversation:goal-activated',
-        {
-          conversationId: this.conversationId,
-          goalId: config.goalId,
-          goalName: config.goalName || 'Active Goal',
-        }
-      );
-
-      // Emit goal session started event
-      const sessionStartContext: GoalSessionStartContext = {
-        goalId: config.goalId,
-        goalName: config.goalName || 'Active Goal',
-        conversationId: this.conversationId,
-        timestamp: startTime,
-      };
-
-      await (this.events as unknown as { emit(event: string, data: unknown): Promise<void> }).emit(
-        'goal:session-started',
-        sessionStartContext
-      );
-
-      // Call onSessionStart callback if provided
-      if (config.onSessionStart) {
-        try {
-          await config.onSessionStart(sessionStartContext);
-        } catch (error) {
-          log.warn('onSessionStart callback error', { error });
-        }
-      }
-    }
 
     // Add system prompt if provided
     if (cfg.systemPrompt) {
@@ -437,14 +340,7 @@ export class ConversationEngine {
 
     try {
       // Run the conversation loop
-      const result = await this.runLoop(cfg, startTime);
-
-      // Emit goal session completed event on success
-      if (config?.goalId) {
-        await this.emitGoalSessionCompleted(config, startTime, result);
-      }
-
-      return result;
+      return await this.runLoop(cfg, startTime);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       await this.events.emit('conversation:failed', { error: errorMessage });
@@ -455,69 +351,14 @@ export class ConversationEngine {
         durationMs: Date.now() - startTime,
       });
 
-      const errorResult = this.createResult(false, errorMessage, Date.now() - startTime);
-
-      // Emit goal session completed event on error
-      if (config?.goalId) {
-        await this.emitGoalSessionCompleted(config, startTime, errorResult);
-      }
-
-      return errorResult;
+      return this.createResult(false, errorMessage, Date.now() - startTime);
     } finally {
       // Finalize debug harness (flush traces, update status)
       // Cast needed because TS narrows status in finally block, but it may have been
-      // set to completed/failed/cancelled/paused by runLoop before reaching here
+      // set to completed/failed/cancelled by runLoop before reaching here
       await this.debugHarness?.finalize(this.status as ConversationStatus);
-
-      // Clear goal context if this conversation was goal-bound
-      if (config?.goalId) {
-        goalContextProvider.clearActiveGoal();
-      }
       this.status = 'idle';
       this.abortController = null;
-    }
-  }
-
-  /**
-   * Emit goal session completed event and call callback
-   */
-  private async emitGoalSessionCompleted(
-    config: ConversationConfig,
-    _startTime: number,
-    result: ConversationResult
-  ): Promise<void> {
-    const sessionSummary: GoalSessionSummary = {
-      toolsExecuted: this.toolResults.map(r => r.toolName),
-      outputPaths: this.outputPaths,
-      tasksCreated: this.currentTodos.length,
-      tasksCompleted: this.currentTodos.filter(t => t.status === 'completed').length,
-    };
-
-    const sessionCompleteContext: GoalSessionCompleteContext = {
-      goalId: config.goalId!,
-      goalName: config.goalName || 'Active Goal',
-      conversationId: this.conversationId,
-      success: result.success,
-      cancelled: result.status === 'cancelled',
-      result: result.result,
-      error: result.error,
-      turns: result.turns,
-      durationMs: result.durationMs,
-      summary: sessionSummary,
-    };
-
-    await (this.events as unknown as { emit(event: string, data: unknown): Promise<void> }).emit(
-      'goal:session-completed',
-      sessionCompleteContext
-    );
-
-    // Call onSessionComplete callback if provided
-    if (config.onSessionComplete) {
-      try {
-        await config.onSessionComplete(sessionCompleteContext);
-      } catch (error) {
-        log.warn('onSessionComplete callback error', { error });
-      }
     }
   }
 
@@ -536,13 +377,6 @@ export class ConversationEngine {
    */
   isRunning(): boolean {
     return this.status === 'running' || this.status === 'waiting_for_user';
-  }
-
-  /**
-   * Check if conversation is paused (waiting for contract approval)
-   */
-  isPaused(): boolean {
-    return this.status === 'paused';
   }
 
   /**
@@ -566,120 +400,6 @@ export class ConversationEngine {
     return this.decisionLogger.getDecisionsSummary();
   }
 
-  // ===========================================================================
-  // CONTRACT RESUME METHODS
-  // ===========================================================================
-
-  /**
-   * Resume conversation after contract approval.
-   * Adds approval confirmation to history and continues execution.
-   */
-  async resumeWithApproval(contractPath: string): Promise<ConversationResult> {
-    if (this.status !== 'paused') {
-      return this.createResult(false, 'Cannot resume: conversation is not paused', 0, this.status);
-    }
-
-    log.info('Resuming with approval', { contractPath, conversationId: this.conversationId });
-
-    this.debugHarness?.trace('resume', 'contract-approved', {
-      contractPath,
-      conversationId: this.conversationId,
-    });
-
-    // Emit approval event
-    await (this.events as unknown as { emit(event: string, data: unknown): Promise<void> }).emit(
-      'contract:approved',
-      { goalId: this.lastConfig?.goalId, contractPath }
-    );
-
-    // Add confirmation message to history
-    this.history.push({
-      role: 'user',
-      content: `[Contract Approved] The contract at ${contractPath} has been approved. You may now proceed with execution.`,
-    });
-
-    // Resume the loop
-    this.status = 'running';
-    const startTime = Date.now();
-
-    if (!this.lastConfig) {
-      return this.createResult(false, 'No configuration found for resume', 0, 'failed');
-    }
-
-    return this.runLoop(this.lastConfig, startTime);
-  }
-
-  /**
-   * Resume conversation with requested changes to the contract.
-   * Adds feedback to history and allows agent to revise.
-   */
-  async resumeWithChanges(feedback: string): Promise<ConversationResult> {
-    if (this.status !== 'paused') {
-      return this.createResult(false, 'Cannot resume: conversation is not paused', 0, this.status);
-    }
-
-    log.info('Resuming with changes requested', { feedback, conversationId: this.conversationId });
-
-    this.debugHarness?.trace('resume', 'changes-requested', {
-      feedbackPreview: feedback.substring(0, 300),
-      conversationId: this.conversationId,
-    });
-
-    // Emit changes-requested event
-    await (this.events as unknown as { emit(event: string, data: unknown): Promise<void> }).emit(
-      'contract:changes-requested',
-      { goalId: this.lastConfig?.goalId, feedback }
-    );
-
-    // Add feedback message to history
-    this.history.push({
-      role: 'user',
-      content: `[Changes Requested] Please revise the contract with the following feedback:\n\n${feedback}\n\nAfter making changes, save the updated contract and call submit_contract again.`,
-    });
-
-    // Resume the loop
-    this.status = 'running';
-    const startTime = Date.now();
-
-    if (!this.lastConfig) {
-      return this.createResult(false, 'No configuration found for resume', 0, 'failed');
-    }
-
-    return this.runLoop(this.lastConfig, startTime);
-  }
-
-  /**
-   * Reject the contract and end the conversation.
-   */
-  async rejectContract(reason?: string): Promise<ConversationResult> {
-    if (this.status !== 'paused') {
-      return this.createResult(false, 'Cannot reject: conversation is not paused', 0, this.status);
-    }
-
-    log.info('Contract rejected', { reason, conversationId: this.conversationId });
-
-    this.debugHarness?.trace('resume', 'contract-rejected', {
-      reason,
-      conversationId: this.conversationId,
-    });
-
-    // Emit rejected event
-    await (this.events as unknown as { emit(event: string, data: unknown): Promise<void> }).emit(
-      'contract:rejected',
-      { goalId: this.lastConfig?.goalId, reason }
-    );
-
-    // Mark as cancelled
-    this.status = 'cancelled';
-    await this.events.emit('conversation:cancelled', { conversationId: this.conversationId });
-
-    return this.createResult(
-      false,
-      reason ? `Contract rejected: ${reason}` : 'Contract rejected by user',
-      0,
-      'cancelled'
-    );
-  }
 
   // ===========================================================================
   // CONVERSATION LOOP
@@ -688,7 +408,7 @@ export class ConversationEngine {
   /**
    * Main conversation loop
    */
-  private async runLoop(config: { maxTurns: number; timeoutMs: number; maxTokensPerTurn: number; requireTodoWrite: boolean; systemPrompt?: string; signal?: AbortSignal; saveToGoalMemory?: boolean; goalId?: string; compression?: CompressionConfig }, startTime: number): Promise<ConversationResult> {
+  private async runLoop(config: { maxTurns: number; timeoutMs: number; maxTokensPerTurn: number; requireTodoWrite: boolean; systemPrompt?: string; signal?: AbortSignal; compression?: CompressionConfig }, startTime: number): Promise<ConversationResult> {
     // Use class-level turn tracking for checkpoint/resume support
     // If resuming, currentTurn will already be set from the snapshot
 
@@ -1057,20 +777,6 @@ export class ConversationEngine {
       // =========================================================================
       // Trust the model's decision to stop. No reflection or verification.
       if (!response.toolCalls || response.toolCalls.length === 0) {
-        // Save goal session if active
-        if (config?.saveToGoalMemory && goalContextProvider.hasActiveGoal()) {
-          try {
-            await this.saveGoalSession(config.goalId!, startTime);
-          } catch (error) {
-            log.warn('Failed to save goal session', { error });
-          }
-        }
-
-        // Clear goal context if this conversation was goal-bound
-        if (config?.goalId) {
-          goalContextProvider.clearActiveGoal();
-        }
-
         // Complete - model decided to stop
         log.info('Conversation complete', { turn: this.currentTurn, finishReason: response.finishReason });
 
@@ -1169,49 +875,6 @@ export class ConversationEngine {
           toolName: toolCall.name, // Required by AI SDK v6
         });
 
-        // =========================================================================
-        // PAUSE TOOL CHECK
-        // =========================================================================
-        // Certain tools signal the conversation should pause for user input
-        // Also check batch_tools results that contain a pause tool
-        const isPauseTool = PAUSE_TOOLS.has(toolCall.name);
-        const isBatchWithPause = toolCall.name === 'batch_tools'
-          && result.success
-          && (result.data as Record<string, unknown>)?._hasPause;
-        const pauseToolName = isPauseTool
-          ? toolCall.name
-          : isBatchWithPause
-            ? String((result.data as Record<string, unknown>)._pauseToolName)
-            : null;
-
-        if ((isPauseTool || isBatchWithPause) && result.success) {
-          log.info('Pause tool triggered', { toolName: pauseToolName });
-
-          this.debugHarness?.trace('pause', 'contract-submitted', {
-            turn: this.currentTurn,
-            toolName: pauseToolName,
-            contractData: result.data,
-          });
-
-          this.status = 'paused';
-
-          await (this.events as unknown as { emit(event: string, data: unknown): Promise<void> }).emit(
-            'conversation:paused',
-            {
-              conversationId: this.conversationId,
-              reason: pauseToolName,
-              data: result.data,
-            }
-          );
-
-          return this.createResult(
-            true,
-            undefined,
-            Date.now() - startTime,
-            'paused',
-            { pauseReason: pauseToolName!, pauseData: result.data }
-          );
-        }
       }
 
       // Trace: turn end
@@ -1276,15 +939,6 @@ export class ConversationEngine {
         todos: toolCall.params.todos,
       });
       return this.handleTodoWrite(toolCall.params);
-    }
-
-    if (toolCall.name === 'submit_contract') {
-      this.debugHarness?.trace('tool-special', 'submit-contract', {
-        turn: this.currentTurn,
-        contractPath: toolCall.params.contract_path,
-        goalId: toolCall.params.goal_id,
-      });
-      return this.handleSubmitContract(toolCall.params);
     }
 
     if (toolCall.name === 'batch_tools') {
@@ -1414,48 +1068,11 @@ export class ConversationEngine {
   }
 
   /**
-   * Handle submit_contract tool
-   *
-   * Submits a contract for user approval. This pauses the conversation
-   * until the user approves, requests changes, or rejects.
-   */
-  private async handleSubmitContract(params: Record<string, unknown>): Promise<ToolResult> {
-    const contractPath = params.contract_path as string;
-    const goalId = params.goal_id as string;
-
-    if (!contractPath || !goalId) {
-      return {
-        success: false,
-        error: 'Missing required parameters: contract_path and goal_id',
-        observation: 'Error: submit_contract requires contract_path and goal_id parameters.',
-      };
-    }
-
-    // Emit event for frontend to show contract approval UI
-    await (this.events as unknown as { emit(event: string, data: unknown): Promise<void> }).emit(
-      'contract:pending-approval',
-      {
-        conversationId: this.conversationId,
-        goalId,
-        contractPath,
-      }
-    );
-
-    return {
-      success: true,
-      data: { contractPath, goalId, awaitingApproval: true },
-      observation: 'Contract submitted for user approval. The conversation will pause until the user approves, requests changes, or rejects.',
-    };
-  }
-
-  /**
    * Handle batch_tools meta-tool
    *
    * Executes multiple tool calls from a single LLM response.
    * This allows models that can't natively produce parallel tool calls
    * to still execute multiple tools per turn.
-   *
-   * Pause tools (submit_contract) are deferred to execute last.
    */
   private async handleBatchTools(params: Record<string, unknown>): Promise<ToolResult> {
     const calls = params.calls as Array<{ tool: string; params: Record<string, unknown> }> | undefined;
@@ -1479,22 +1096,9 @@ export class ConversationEngine {
 
     log.info('Executing batch_tools', { callCount: calls.length, tools: calls.map(c => c.tool) });
 
-    // Separate pause tools from regular tools so pause tools execute last
-    const regularCalls: typeof calls = [];
-    const pauseCalls: typeof calls = [];
-    for (const call of calls) {
-      if (PAUSE_TOOLS.has(call.tool)) {
-        pauseCalls.push(call);
-      } else {
-        regularCalls.push(call);
-      }
-    }
-
-    const orderedCalls = [...regularCalls, ...pauseCalls];
     const results: Array<{ tool: string; result: ToolResult }> = [];
-    let pauseResult: ToolResult | null = null;
 
-    for (const call of orderedCalls) {
+    for (const call of calls) {
       const subToolCall: ToolCall = {
         id: `batch_${call.tool}_${Date.now()}`,
         name: call.tool,
@@ -1530,11 +1134,6 @@ export class ConversationEngine {
       if (toolMeta.category === 'mutation' && result.success) {
         this.hasProducedOutput = true;
       }
-
-      // If this is a pause tool, remember it for special handling
-      if (PAUSE_TOOLS.has(call.tool) && result.success) {
-        pauseResult = result;
-      }
     }
 
     // Format combined results
@@ -1545,23 +1144,11 @@ export class ConversationEngine {
       combinedParts.push(formatted);
     }
 
-    const combinedResult: ToolResult = {
+    return {
       success: results.every(r => r.result.success),
       data: { batchResults: results.map(r => ({ tool: r.tool, success: r.result.success, data: r.result.data })) },
       observation: combinedParts.join('\n'),
     };
-
-    // If a pause tool was executed, mark the result so the main loop can handle it
-    if (pauseResult) {
-      combinedResult.data = {
-        ...(combinedResult.data as Record<string, unknown>),
-        ...pauseResult.data as Record<string, unknown>,
-        _hasPause: true,
-        _pauseToolName: results.find(r => PAUSE_TOOLS.has(r.tool))?.tool,
-      };
-    }
-
-    return combinedResult;
   }
 
   // ===========================================================================
@@ -1679,7 +1266,6 @@ export class ConversationEngine {
     error: string | undefined,
     durationMs: number,
     status?: ConversationStatus,
-    pauseInfo?: { pauseReason: string; pauseData: unknown }
   ): ConversationResult {
     return {
       success,
@@ -1689,8 +1275,6 @@ export class ConversationEngine {
       turns: this.countTurns(),
       durationMs,
       messages: [...this.history],
-      pauseReason: pauseInfo?.pauseReason,
-      pauseData: pauseInfo?.pauseData,
     };
   }
 
@@ -1718,77 +1302,6 @@ export class ConversationEngine {
    */
   private generateId(): string {
     return `conv_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-  }
-
-  // ===========================================================================
-  // GOAL SESSION MANAGEMENT
-  // ===========================================================================
-
-  /**
-   * Save conversation session to goal memory
-   */
-  private async saveGoalSession(goalId: string, startTime: number): Promise<void> {
-    log.info('Saving goal session', { goalId, conversationId: this.conversationId });
-
-    // Create session summary
-    const endTime = Date.now();
-    const sessionData = {
-      conversationId: this.conversationId,
-      startTime,
-      endTime,
-      turns: this.currentTurn,
-      originalGoal: this.originalGoal,
-      tasksCreated: this.currentTodos.length,
-      toolsExecuted: this.toolResults.length,
-      outputPaths: this.outputPaths,
-      status: this.status,
-    };
-
-    // Format for episodic memory
-    const dateStr = new Date().toISOString().split('T')[0];
-    const durationSecs = Math.round((endTime - startTime) / 1000);
-    const tasksSummary = this.currentTodos
-      .map(t => `- [${t.status === 'completed' ? 'x' : ' '}] ${t.content}`)
-      .join('\n');
-
-    const sessionEntry = `
-## Session ${dateStr}
-
-**Goal**: ${this.originalGoal}
-**Duration**: ${durationSecs}s
-**Turns**: ${this.currentTurn}
-**Tasks Created**: ${this.currentTodos.length}
-**Files Modified**: ${this.outputPaths.length}
-
-### Summary
-${tasksSummary || '- No tasks tracked'}
-
----
-`;
-
-    try {
-      // Append to episodic memory
-      await invoke('append_goal_memory', {
-        goalId,
-        memoryType: 'episodic',
-        content: sessionEntry,
-      });
-
-      log.info('Goal session saved to episodic memory', { goalId });
-
-      // Emit event (using type assertion for custom events)
-      await (this.events as unknown as { emit(event: string, data: unknown): Promise<void> }).emit(
-        'conversation:goal-session-saved',
-        {
-          conversationId: this.conversationId,
-          goalId,
-          sessionData,
-        }
-      );
-    } catch (error) {
-      log.error('Failed to save goal session to memory', { error, goalId });
-      throw error;
-    }
   }
 
   // ===========================================================================

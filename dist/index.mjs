@@ -775,11 +775,6 @@ var TODOWRITE_EXEMPT_TOOLS = [
   "AskUserQuestion",
   // Claude Code alias
   // ==========================================================================
-  // CONTRACT SUBMISSION
-  // Allowed before TodoWrite (pauses for user approval)
-  // ==========================================================================
-  "submit_contract",
-  // ==========================================================================
   // SEARCH TOOLS
   // Full-text, vector, and hybrid search - read-only
   // ==========================================================================
@@ -1388,82 +1383,8 @@ function getTodoWriteGuidance(input) {
   return { level: "none", message: null };
 }
 
-// src/providers/GoalContextProvider.ts
-var log5 = createLogger("GoalContextProvider");
-var GoalContextProviderImpl = class {
-  context = {
-    goalId: null,
-    goalName: null
-  };
-  /**
-   * Set the active goal for context
-   */
-  setActiveGoal(goalId, goalName) {
-    this.context.goalId = goalId;
-    this.context.goalName = goalName;
-    log5.debug("Active goal set", { goalId, goalName });
-  }
-  /**
-   * Clear the active goal
-   */
-  clearActiveGoal() {
-    this.context.goalId = null;
-    this.context.goalName = null;
-    log5.debug("Active goal cleared");
-  }
-  /**
-   * Check if there's an active goal
-   */
-  hasActiveGoal() {
-    return this.context.goalId !== null;
-  }
-  /**
-   * Get the current active goal ID
-   */
-  getActiveGoalId() {
-    return this.context.goalId;
-  }
-  /**
-   * Get the current active goal name
-   */
-  getActiveGoalName() {
-    return this.context.goalName;
-  }
-  /**
-   * Get context for the current goal (stub - returns empty)
-   */
-  async getGoalContext() {
-    if (!this.context.goalId) {
-      return "";
-    }
-    return `Goal: ${this.context.goalName || this.context.goalId}`;
-  }
-};
-var goalContextProvider = new GoalContextProviderImpl();
-
-// src/backend.ts
-var log6 = createLogger("Backend");
-var noopBackend = {
-  async invoke(command, args) {
-    log6.debug("Backend invoke (no-op)", { command, args });
-    return null;
-  }
-};
-var currentBackend = noopBackend;
-function setBackend(backend) {
-  currentBackend = backend;
-  log6.info("Backend set", { hasInvoke: typeof backend.invoke === "function" });
-}
-function getBackend() {
-  return currentBackend;
-}
-async function invoke(command, args) {
-  return currentBackend.invoke(command, args);
-}
-
 // src/kernel/ConversationEngine.ts
-var log7 = createLogger("ConversationEngine");
-var PAUSE_TOOLS = /* @__PURE__ */ new Set(["submit_contract"]);
+var log5 = createLogger("ConversationEngine");
 var DEFAULT_CONFIG4 = {
   maxTurns: 50,
   timeoutMs: 6e5,
@@ -1547,9 +1468,9 @@ var ConversationEngine = class {
    * Execute a conversation with the given prompt
    */
   async execute(prompt, config) {
-    log7.info("Execute called", { promptLength: prompt.length, hasConfig: !!config });
+    log5.info("Execute called", { promptLength: prompt.length, hasConfig: !!config });
     if (this.isRunning()) {
-      log7.warn("Conversation already running");
+      log5.warn("Conversation already running");
       return this.createResult(false, "Conversation already running", 0);
     }
     const cfg = {
@@ -1561,12 +1482,9 @@ var ConversationEngine = class {
       // These don't have defaults in DEFAULT_CONFIG
       systemPrompt: config?.systemPrompt,
       signal: config?.signal,
-      // Additional fields for resume
-      saveToGoalMemory: config?.saveToGoalMemory,
-      goalId: config?.goalId,
       compression: config?.compression
     };
-    log7.info("Merged config", { maxTurns: cfg.maxTurns, timeoutMs: cfg.timeoutMs, requireTodoWrite: cfg.requireTodoWrite });
+    log5.info("Merged config", { maxTurns: cfg.maxTurns, timeoutMs: cfg.timeoutMs, requireTodoWrite: cfg.requireTodoWrite });
     this.lastConfig = cfg;
     this.history = [];
     this.status = "running";
@@ -1581,49 +1499,18 @@ var ConversationEngine = class {
       promptLength: prompt.length,
       prompt,
       config: { maxTurns: cfg.maxTurns, timeoutMs: cfg.timeoutMs, requireTodoWrite: cfg.requireTodoWrite },
-      hasSystemPrompt: !!cfg.systemPrompt,
-      hasGoalId: !!config?.goalId,
-      goalId: config?.goalId
+      hasSystemPrompt: !!cfg.systemPrompt
     });
-    if (config?.goalId) {
-      goalContextProvider.setActiveGoal(config.goalId, config.goalName || "Active Goal");
-      log7.info("Activated goal context", { goalId: config.goalId, goalName: config.goalName });
-      await this.events.emit(
-        "conversation:goal-activated",
-        {
-          conversationId: this.conversationId,
-          goalId: config.goalId,
-          goalName: config.goalName || "Active Goal"
-        }
-      );
-      const sessionStartContext = {
-        goalId: config.goalId,
-        goalName: config.goalName || "Active Goal",
-        conversationId: this.conversationId,
-        timestamp: startTime
-      };
-      await this.events.emit(
-        "goal:session-started",
-        sessionStartContext
-      );
-      if (config.onSessionStart) {
-        try {
-          await config.onSessionStart(sessionStartContext);
-        } catch (error) {
-          log7.warn("onSessionStart callback error", { error });
-        }
-      }
-    }
     if (cfg.systemPrompt) {
       this.history.push({ role: "system", content: cfg.systemPrompt });
-      log7.debug("Added system prompt", { length: cfg.systemPrompt.length });
+      log5.debug("Added system prompt", { length: cfg.systemPrompt.length });
     } else {
-      log7.warn("No system prompt provided - LLM may not use tools effectively");
+      log5.warn("No system prompt provided - LLM may not use tools effectively");
     }
     this.history.push({ role: "user", content: prompt });
     this.originalGoal = prompt;
     this.intentClassification = await classifyIntent(prompt, this.history, this.llmClassifyFn);
-    log7.info("Intent classified", {
+    log5.info("Intent classified", {
       complexity: this.intentClassification.complexity,
       confidence: this.intentClassification.confidence,
       suggestedActions: this.intentClassification.suggestedActions
@@ -1640,7 +1527,7 @@ var ConversationEngine = class {
       todoWriteRequired: cfg.requireTodoWrite
     });
     if (canSkipTodoWrite(this.intentClassification)) {
-      log7.info("Skipping TodoWrite requirement due to task complexity", {
+      log5.info("Skipping TodoWrite requirement due to task complexity", {
         complexity: this.intentClassification.complexity
       });
       cfg.requireTodoWrite = false;
@@ -1650,7 +1537,7 @@ var ConversationEngine = class {
       });
     }
     if (needsClarification(this.intentClassification)) {
-      log7.info("Task needs clarification - injecting agent_ask_user enforcement");
+      log5.info("Task needs clarification - injecting agent_ask_user enforcement");
       this.history.push({
         role: "user",
         content: `[System Instruction] IMPORTANT: This request requires clarifying questions. You MUST use the agent_ask_user tool with structured questions and options. DO NOT ask questions in plain text. Call agent_ask_user now with 2-4 relevant questions before proceeding.`
@@ -1671,11 +1558,7 @@ var ConversationEngine = class {
       this.contextCompressor.updateConfig(config.compression);
     }
     try {
-      const result = await this.runLoop(cfg, startTime);
-      if (config?.goalId) {
-        await this.emitGoalSessionCompleted(config, startTime, result);
-      }
-      return result;
+      return await this.runLoop(cfg, startTime);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       await this.events.emit("conversation:failed", { error: errorMessage });
@@ -1684,52 +1567,11 @@ var ConversationEngine = class {
         turn: this.currentTurn,
         durationMs: Date.now() - startTime
       });
-      const errorResult = this.createResult(false, errorMessage, Date.now() - startTime);
-      if (config?.goalId) {
-        await this.emitGoalSessionCompleted(config, startTime, errorResult);
-      }
-      return errorResult;
+      return this.createResult(false, errorMessage, Date.now() - startTime);
     } finally {
       await this.debugHarness?.finalize(this.status);
-      if (config?.goalId) {
-        goalContextProvider.clearActiveGoal();
-      }
       this.status = "idle";
       this.abortController = null;
-    }
-  }
-  /**
-   * Emit goal session completed event and call callback
-   */
-  async emitGoalSessionCompleted(config, _startTime, result) {
-    const sessionSummary = {
-      toolsExecuted: this.toolResults.map((r) => r.toolName),
-      outputPaths: this.outputPaths,
-      tasksCreated: this.currentTodos.length,
-      tasksCompleted: this.currentTodos.filter((t) => t.status === "completed").length
-    };
-    const sessionCompleteContext = {
-      goalId: config.goalId,
-      goalName: config.goalName || "Active Goal",
-      conversationId: this.conversationId,
-      success: result.success,
-      cancelled: result.status === "cancelled",
-      result: result.result,
-      error: result.error,
-      turns: result.turns,
-      durationMs: result.durationMs,
-      summary: sessionSummary
-    };
-    await this.events.emit(
-      "goal:session-completed",
-      sessionCompleteContext
-    );
-    if (config.onSessionComplete) {
-      try {
-        await config.onSessionComplete(sessionCompleteContext);
-      } catch (error) {
-        log7.warn("onSessionComplete callback error", { error });
-      }
     }
   }
   /**
@@ -1746,12 +1588,6 @@ var ConversationEngine = class {
    */
   isRunning() {
     return this.status === "running" || this.status === "waiting_for_user";
-  }
-  /**
-   * Check if conversation is paused (waiting for contract approval)
-   */
-  isPaused() {
-    return this.status === "paused";
   }
   /**
    * Get current conversation status
@@ -1772,101 +1608,13 @@ var ConversationEngine = class {
     return this.decisionLogger.getDecisionsSummary();
   }
   // ===========================================================================
-  // CONTRACT RESUME METHODS
-  // ===========================================================================
-  /**
-   * Resume conversation after contract approval.
-   * Adds approval confirmation to history and continues execution.
-   */
-  async resumeWithApproval(contractPath) {
-    if (this.status !== "paused") {
-      return this.createResult(false, "Cannot resume: conversation is not paused", 0, this.status);
-    }
-    log7.info("Resuming with approval", { contractPath, conversationId: this.conversationId });
-    this.debugHarness?.trace("resume", "contract-approved", {
-      contractPath,
-      conversationId: this.conversationId
-    });
-    await this.events.emit(
-      "contract:approved",
-      { goalId: this.lastConfig?.goalId, contractPath }
-    );
-    this.history.push({
-      role: "user",
-      content: `[Contract Approved] The contract at ${contractPath} has been approved. You may now proceed with execution.`
-    });
-    this.status = "running";
-    const startTime = Date.now();
-    if (!this.lastConfig) {
-      return this.createResult(false, "No configuration found for resume", 0, "failed");
-    }
-    return this.runLoop(this.lastConfig, startTime);
-  }
-  /**
-   * Resume conversation with requested changes to the contract.
-   * Adds feedback to history and allows agent to revise.
-   */
-  async resumeWithChanges(feedback) {
-    if (this.status !== "paused") {
-      return this.createResult(false, "Cannot resume: conversation is not paused", 0, this.status);
-    }
-    log7.info("Resuming with changes requested", { feedback, conversationId: this.conversationId });
-    this.debugHarness?.trace("resume", "changes-requested", {
-      feedbackPreview: feedback.substring(0, 300),
-      conversationId: this.conversationId
-    });
-    await this.events.emit(
-      "contract:changes-requested",
-      { goalId: this.lastConfig?.goalId, feedback }
-    );
-    this.history.push({
-      role: "user",
-      content: `[Changes Requested] Please revise the contract with the following feedback:
-
-${feedback}
-
-After making changes, save the updated contract and call submit_contract again.`
-    });
-    this.status = "running";
-    const startTime = Date.now();
-    if (!this.lastConfig) {
-      return this.createResult(false, "No configuration found for resume", 0, "failed");
-    }
-    return this.runLoop(this.lastConfig, startTime);
-  }
-  /**
-   * Reject the contract and end the conversation.
-   */
-  async rejectContract(reason) {
-    if (this.status !== "paused") {
-      return this.createResult(false, "Cannot reject: conversation is not paused", 0, this.status);
-    }
-    log7.info("Contract rejected", { reason, conversationId: this.conversationId });
-    this.debugHarness?.trace("resume", "contract-rejected", {
-      reason,
-      conversationId: this.conversationId
-    });
-    await this.events.emit(
-      "contract:rejected",
-      { goalId: this.lastConfig?.goalId, reason }
-    );
-    this.status = "cancelled";
-    await this.events.emit("conversation:cancelled", { conversationId: this.conversationId });
-    return this.createResult(
-      false,
-      reason ? `Contract rejected: ${reason}` : "Contract rejected by user",
-      0,
-      "cancelled"
-    );
-  }
-  // ===========================================================================
   // CONVERSATION LOOP
   // ===========================================================================
   /**
    * Main conversation loop
    */
   async runLoop(config, startTime) {
-    log7.info("Starting conversation loop", { maxTurns: config.maxTurns, timeoutMs: config.timeoutMs, startTurn: this.currentTurn });
+    log5.info("Starting conversation loop", { maxTurns: config.maxTurns, timeoutMs: config.timeoutMs, startTurn: this.currentTurn });
     while (this.currentTurn < config.maxTurns) {
       if (this.abortController?.signal.aborted || config.signal?.aborted) {
         this.debugHarness?.trace("termination", "cancelled", {
@@ -1885,7 +1633,7 @@ After making changes, save the updated contract and call submit_contract again.`
       this.history = this.history.filter(
         (m) => !(m.role === "user" && (m.content.startsWith("[System Reminder]") || m.content.startsWith("[Active Tasks]")))
       );
-      log7.info("Turn", { turn: this.currentTurn, historyLength: this.history.length });
+      log5.info("Turn", { turn: this.currentTurn, historyLength: this.history.length });
       this.debugHarness?.setTurn(this.currentTurn);
       this.debugHarness?.trace("turn-start", "turn-begin", {
         turn: this.currentTurn,
@@ -1917,7 +1665,7 @@ After making changes, save the updated contract and call submit_contract again.`
             role: "user",
             content: `[System Reminder] ${guidance.message}`
           });
-          log7.info("TodoWrite guidance injected", {
+          log5.info("TodoWrite guidance injected", {
             level: guidance.level,
             turn: this.currentTurn
           });
@@ -1943,14 +1691,14 @@ ${activeTodos}`
         const remainingTime = config.timeoutMs - (Date.now() - startTime);
         if (remainingTime <= 0) {
           this.status = "failed";
-          log7.warn("Timeout before LLM call", { turn: this.currentTurn });
+          log5.warn("Timeout before LLM call", { turn: this.currentTurn });
           return this.createResult(false, "Conversation timeout", Date.now() - startTime, "failed");
         }
         const toolsList = this.tools.list();
-        log7.debug("=".repeat(80));
-        log7.debug(`TURN ${this.currentTurn} - SENDING TO LLM`);
-        log7.debug("=".repeat(80));
-        log7.debug("Message History:", {
+        log5.debug("=".repeat(80));
+        log5.debug(`TURN ${this.currentTurn} - SENDING TO LLM`);
+        log5.debug("=".repeat(80));
+        log5.debug("Message History:", {
           messageCount: this.history.length,
           messages: this.history.map((msg, idx) => ({
             index: idx,
@@ -1962,9 +1710,9 @@ ${activeTodos}`
             toolNames: msg.toolCalls?.map((tc) => tc.name)
           }))
         });
-        log7.debug("Available Tools:", { count: toolsList.length, tools: toolsList.map((t) => t.name) });
-        log7.debug("Full Prompt:", { history: this.history });
-        log7.debug("=".repeat(80));
+        log5.debug("Available Tools:", { count: toolsList.length, tools: toolsList.map((t) => t.name) });
+        log5.debug("Full Prompt:", { history: this.history });
+        log5.debug("=".repeat(80));
         let messagesToSend = this.history;
         if (config.compression) {
           this.contextCompressor.updateConfig(config.compression);
@@ -1975,7 +1723,7 @@ ${activeTodos}`
         );
         if (compressionResult.wasCompressed) {
           messagesToSend = compressionResult.messages;
-          log7.info("Context compressed before LLM call", {
+          log5.info("Context compressed before LLM call", {
             originalTokens: compressionResult.originalTokens,
             compressedTokens: compressionResult.compressedTokens,
             summarizedTurns: compressionResult.summarizedTurns
@@ -2008,18 +1756,18 @@ ${activeTodos}`
           }, remainingTime);
         });
         response = await Promise.race([llmPromise, timeoutPromise]);
-        log7.debug("=".repeat(80));
-        log7.debug(`TURN ${this.currentTurn} - RECEIVED FROM LLM`);
-        log7.debug("=".repeat(80));
-        log7.debug("Response Summary:", {
+        log5.debug("=".repeat(80));
+        log5.debug(`TURN ${this.currentTurn} - RECEIVED FROM LLM`);
+        log5.debug("=".repeat(80));
+        log5.debug("Response Summary:", {
           contentLength: response.content?.length ?? 0,
           hasToolCalls: !!response.toolCalls,
           toolCallCount: response.toolCalls?.length ?? 0,
           finishReason: response.finishReason
         });
-        log7.debug("Content:", { content: response.content });
+        log5.debug("Content:", { content: response.content });
         if (response.toolCalls && response.toolCalls.length > 0) {
-          log7.debug("Tool Calls:", {
+          log5.debug("Tool Calls:", {
             toolCalls: response.toolCalls.map((tc) => ({
               id: tc.id,
               name: tc.name,
@@ -2027,8 +1775,8 @@ ${activeTodos}`
             }))
           });
         }
-        log7.debug("Full Response:", { response });
-        log7.debug("=".repeat(80));
+        log5.debug("Full Response:", { response });
+        log5.debug("=".repeat(80));
         this.debugHarness?.trace("llm-response", "received-from-llm", {
           turn: this.currentTurn,
           contentLength: response.content?.length ?? 0,
@@ -2039,7 +1787,7 @@ ${activeTodos}`
           usage: response.usage
         });
       } catch (error) {
-        log7.error("LLM call failed", { turn: this.currentTurn, error: error.message, name: error.name });
+        log5.error("LLM call failed", { turn: this.currentTurn, error: error.message, name: error.name });
         this.debugHarness?.trace("error", "llm-call-failed", {
           turn: this.currentTurn,
           errorName: error.name,
@@ -2068,20 +1816,20 @@ ${activeTodos}`
         );
         if (hasTodoWrite) {
           this.hasPlan = true;
-          log7.info("TodoWrite called - plan established", { turn: this.currentTurn });
+          log5.info("TodoWrite called - plan established", { turn: this.currentTurn });
           this.debugHarness?.trace("todowrite-gate", "plan-established", {
             turn: this.currentTurn
           });
         } else if (response.toolCalls && response.toolCalls.length > 0) {
           const exemptTools = filterExemptTools(response.toolCalls);
           const actionTools = filterActionTools(response.toolCalls);
-          log7.debug("Tool exemption check", {
+          log5.debug("Tool exemption check", {
             turn: this.currentTurn,
             exemptTools: exemptTools.map((tc) => tc.name),
             actionTools: actionTools.map((tc) => tc.name)
           });
           if (actionTools.length === 0 && exemptTools.length > 0) {
-            log7.info("Allowing exempt tools without TodoWrite", {
+            log5.info("Allowing exempt tools without TodoWrite", {
               turn: this.currentTurn,
               tools: exemptTools.map((tc) => tc.name)
             });
@@ -2092,7 +1840,7 @@ ${activeTodos}`
             });
           } else if (actionTools.length > 0) {
             this.planEnforcementAttempts++;
-            log7.warn("Agent using action tools without TodoWrite plan", {
+            log5.warn("Agent using action tools without TodoWrite plan", {
               turn: this.currentTurn,
               attempt: this.planEnforcementAttempts,
               maxAttempts: this.MAX_PLAN_ENFORCEMENT_ATTEMPTS,
@@ -2135,20 +1883,10 @@ ${activeTodos}`
         }
       }
       if (!this.hasPlan && this.currentTurn > this.MAX_PLAN_ENFORCEMENT_ATTEMPTS) {
-        log7.warn("Agent proceeding without TodoWrite plan after max enforcement attempts");
+        log5.warn("Agent proceeding without TodoWrite plan after max enforcement attempts");
       }
       if (!response.toolCalls || response.toolCalls.length === 0) {
-        if (config?.saveToGoalMemory && goalContextProvider.hasActiveGoal()) {
-          try {
-            await this.saveGoalSession(config.goalId, startTime);
-          } catch (error) {
-            log7.warn("Failed to save goal session", { error });
-          }
-        }
-        if (config?.goalId) {
-          goalContextProvider.clearActiveGoal();
-        }
-        log7.info("Conversation complete", { turn: this.currentTurn, finishReason: response.finishReason });
+        log5.info("Conversation complete", { turn: this.currentTurn, finishReason: response.finishReason });
         this.debugHarness?.trace("completion", "conversation-done", {
           turn: this.currentTurn,
           finishReason: response.finishReason,
@@ -2167,18 +1905,18 @@ ${activeTodos}`
       }
       for (const toolCall of response.toolCalls) {
         await this.events.emit("conversation:tool-call", { toolCall });
-        log7.debug("-".repeat(80));
-        log7.debug(`EXECUTING TOOL: ${toolCall.name}`);
-        log7.debug("Tool Parameters:", { params: toolCall.params });
+        log5.debug("-".repeat(80));
+        log5.debug(`EXECUTING TOOL: ${toolCall.name}`);
+        log5.debug("Tool Parameters:", { params: toolCall.params });
         const result = await this.executeTool(toolCall);
-        log7.debug("Tool Result:", {
+        log5.debug("Tool Result:", {
           success: result.success,
           hasData: !!result.data,
           hasError: !!result.error,
           observation: result.observation,
           fullResult: result
         });
-        log7.debug("-".repeat(80));
+        log5.debug("-".repeat(80));
         this.debugHarness?.trace("tool-exec", `tool:${toolCall.name}`, {
           turn: this.currentTurn,
           toolName: toolCall.name,
@@ -2222,33 +1960,6 @@ ${activeTodos}`
           toolName: toolCall.name
           // Required by AI SDK v6
         });
-        const isPauseTool = PAUSE_TOOLS.has(toolCall.name);
-        const isBatchWithPause = toolCall.name === "batch_tools" && result.success && result.data?._hasPause;
-        const pauseToolName = isPauseTool ? toolCall.name : isBatchWithPause ? String(result.data._pauseToolName) : null;
-        if ((isPauseTool || isBatchWithPause) && result.success) {
-          log7.info("Pause tool triggered", { toolName: pauseToolName });
-          this.debugHarness?.trace("pause", "contract-submitted", {
-            turn: this.currentTurn,
-            toolName: pauseToolName,
-            contractData: result.data
-          });
-          this.status = "paused";
-          await this.events.emit(
-            "conversation:paused",
-            {
-              conversationId: this.conversationId,
-              reason: pauseToolName,
-              data: result.data
-            }
-          );
-          return this.createResult(
-            true,
-            void 0,
-            Date.now() - startTime,
-            "paused",
-            { pauseReason: pauseToolName, pauseData: result.data }
-          );
-        }
       }
       this.debugHarness?.trace("turn-end", "turn-complete", {
         turn: this.currentTurn,
@@ -2269,7 +1980,7 @@ ${activeTodos}`
       durationMs: Date.now() - startTime
     });
     this.status = "timeout";
-    log7.warn("Max turns reached", { maxTurns: config.maxTurns, actualTurns: this.currentTurn });
+    log5.warn("Max turns reached", { maxTurns: config.maxTurns, actualTurns: this.currentTurn });
     await this.events.emit(
       "conversation:timeout",
       { conversationId: this.conversationId }
@@ -2283,7 +1994,7 @@ ${activeTodos}`
    * Execute a single tool call
    */
   async executeTool(toolCall) {
-    log7.info("Tool", { name: toolCall.name });
+    log5.info("Tool", { name: toolCall.name });
     if (toolCall.name === "AskUserQuestion") {
       this.debugHarness?.trace("tool-special", "ask-user-question", {
         turn: this.currentTurn,
@@ -2298,14 +2009,6 @@ ${activeTodos}`
         todos: toolCall.params.todos
       });
       return this.handleTodoWrite(toolCall.params);
-    }
-    if (toolCall.name === "submit_contract") {
-      this.debugHarness?.trace("tool-special", "submit-contract", {
-        turn: this.currentTurn,
-        contractPath: toolCall.params.contract_path,
-        goalId: toolCall.params.goal_id
-      });
-      return this.handleSubmitContract(toolCall.params);
     }
     if (toolCall.name === "batch_tools") {
       this.debugHarness?.trace("tool-special", "batch-tools", {
@@ -2341,7 +2044,7 @@ ${activeTodos}`
       {
         signal: this.abortController?.signal,
         onRetry: (attempt, error, delayMs) => {
-          log7.info(`Retrying tool ${toolCall.name}`, {
+          log5.info(`Retrying tool ${toolCall.name}`, {
             attempt,
             error: error.message,
             delayMs
@@ -2408,43 +2111,11 @@ ${activeTodos}`
     };
   }
   /**
-   * Handle submit_contract tool
-   *
-   * Submits a contract for user approval. This pauses the conversation
-   * until the user approves, requests changes, or rejects.
-   */
-  async handleSubmitContract(params) {
-    const contractPath = params.contract_path;
-    const goalId = params.goal_id;
-    if (!contractPath || !goalId) {
-      return {
-        success: false,
-        error: "Missing required parameters: contract_path and goal_id",
-        observation: "Error: submit_contract requires contract_path and goal_id parameters."
-      };
-    }
-    await this.events.emit(
-      "contract:pending-approval",
-      {
-        conversationId: this.conversationId,
-        goalId,
-        contractPath
-      }
-    );
-    return {
-      success: true,
-      data: { contractPath, goalId, awaitingApproval: true },
-      observation: "Contract submitted for user approval. The conversation will pause until the user approves, requests changes, or rejects."
-    };
-  }
-  /**
    * Handle batch_tools meta-tool
    *
    * Executes multiple tool calls from a single LLM response.
    * This allows models that can't natively produce parallel tool calls
    * to still execute multiple tools per turn.
-   *
-   * Pause tools (submit_contract) are deferred to execute last.
    */
   async handleBatchTools(params) {
     const calls = params.calls;
@@ -2462,26 +2133,15 @@ ${activeTodos}`
         observation: 'Error: batch_tools "calls" array is empty. Provide at least one tool call.'
       };
     }
-    log7.info("Executing batch_tools", { callCount: calls.length, tools: calls.map((c) => c.tool) });
-    const regularCalls = [];
-    const pauseCalls = [];
-    for (const call of calls) {
-      if (PAUSE_TOOLS.has(call.tool)) {
-        pauseCalls.push(call);
-      } else {
-        regularCalls.push(call);
-      }
-    }
-    const orderedCalls = [...regularCalls, ...pauseCalls];
+    log5.info("Executing batch_tools", { callCount: calls.length, tools: calls.map((c) => c.tool) });
     const results = [];
-    let pauseResult = null;
-    for (const call of orderedCalls) {
+    for (const call of calls) {
       const subToolCall = {
         id: `batch_${call.tool}_${Date.now()}`,
         name: call.tool,
         params: call.params || {}
       };
-      log7.debug("Batch: executing sub-tool", { tool: call.tool });
+      log5.debug("Batch: executing sub-tool", { tool: call.tool });
       const result = await this.executeTool(subToolCall);
       results.push({ tool: call.tool, result });
       await this.events.emit("conversation:tool-call", { toolCall: subToolCall });
@@ -2502,9 +2162,6 @@ ${activeTodos}`
       if (toolMeta.category === "mutation" && result.success) {
         this.hasProducedOutput = true;
       }
-      if (PAUSE_TOOLS.has(call.tool) && result.success) {
-        pauseResult = result;
-      }
     }
     const combinedParts = [`[BATCH] Executed ${results.length} tool(s):`];
     for (const { tool: tool2, result } of results) {
@@ -2513,20 +2170,11 @@ ${activeTodos}`
 --- ${tool2} ---`);
       combinedParts.push(formatted);
     }
-    const combinedResult = {
+    return {
       success: results.every((r) => r.result.success),
       data: { batchResults: results.map((r) => ({ tool: r.tool, success: r.result.success, data: r.result.data })) },
       observation: combinedParts.join("\n")
     };
-    if (pauseResult) {
-      combinedResult.data = {
-        ...combinedResult.data,
-        ...pauseResult.data,
-        _hasPause: true,
-        _pauseToolName: results.find((r) => PAUSE_TOOLS.has(r.tool))?.tool
-      };
-    }
-    return combinedResult;
   }
   // ===========================================================================
   // HELPERS
@@ -2613,7 +2261,7 @@ ${key} (${arr.length} items):`);
   /**
    * Create a conversation result
    */
-  createResult(success, error, durationMs, status, pauseInfo) {
+  createResult(success, error, durationMs, status) {
     return {
       success,
       result: success ? this.getLastAssistantContent() : void 0,
@@ -2621,9 +2269,7 @@ ${key} (${arr.length} items):`);
       status: status ?? (success ? "completed" : "failed"),
       turns: this.countTurns(),
       durationMs,
-      messages: [...this.history],
-      pauseReason: pauseInfo?.pauseReason,
-      pauseData: pauseInfo?.pauseData
+      messages: [...this.history]
     };
   }
   /**
@@ -2650,63 +2296,6 @@ ${key} (${arr.length} items):`);
     return `conv_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
   }
   // ===========================================================================
-  // GOAL SESSION MANAGEMENT
-  // ===========================================================================
-  /**
-   * Save conversation session to goal memory
-   */
-  async saveGoalSession(goalId, startTime) {
-    log7.info("Saving goal session", { goalId, conversationId: this.conversationId });
-    const endTime = Date.now();
-    const sessionData = {
-      conversationId: this.conversationId,
-      startTime,
-      endTime,
-      turns: this.currentTurn,
-      originalGoal: this.originalGoal,
-      tasksCreated: this.currentTodos.length,
-      toolsExecuted: this.toolResults.length,
-      outputPaths: this.outputPaths,
-      status: this.status
-    };
-    const dateStr = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
-    const durationSecs = Math.round((endTime - startTime) / 1e3);
-    const tasksSummary = this.currentTodos.map((t) => `- [${t.status === "completed" ? "x" : " "}] ${t.content}`).join("\n");
-    const sessionEntry = `
-## Session ${dateStr}
-
-**Goal**: ${this.originalGoal}
-**Duration**: ${durationSecs}s
-**Turns**: ${this.currentTurn}
-**Tasks Created**: ${this.currentTodos.length}
-**Files Modified**: ${this.outputPaths.length}
-
-### Summary
-${tasksSummary || "- No tasks tracked"}
-
----
-`;
-    try {
-      await invoke("append_goal_memory", {
-        goalId,
-        memoryType: "episodic",
-        content: sessionEntry
-      });
-      log7.info("Goal session saved to episodic memory", { goalId });
-      await this.events.emit(
-        "conversation:goal-session-saved",
-        {
-          conversationId: this.conversationId,
-          goalId,
-          sessionData
-        }
-      );
-    } catch (error) {
-      log7.error("Failed to save goal session to memory", { error, goalId });
-      throw error;
-    }
-  }
-  // ===========================================================================
   // CHECKPOINT/RESUME
   // ===========================================================================
   /**
@@ -2716,7 +2305,7 @@ ${tasksSummary || "- No tasks tracked"}
    */
   async checkpoint() {
     if (!this.conversationId) {
-      log7.warn("Cannot checkpoint: no active conversation");
+      log5.warn("Cannot checkpoint: no active conversation");
       return;
     }
     const snapshot = this.store.createSnapshot(
@@ -2734,7 +2323,7 @@ ${tasksSummary || "- No tasks tracked"}
       }
     );
     await this.store.save(snapshot);
-    log7.debug("Checkpoint saved", { id: this.conversationId, turn: this.currentTurn });
+    log5.debug("Checkpoint saved", { id: this.conversationId, turn: this.currentTurn });
     await this.events.emit("conversation:checkpoint", {
       conversationId: this.conversationId,
       turn: this.currentTurn
@@ -2748,14 +2337,14 @@ ${tasksSummary || "- No tasks tracked"}
    * @returns ConversationResult from continued execution
    */
   async resume(conversationId, config) {
-    log7.info("Resuming conversation", { id: conversationId });
+    log5.info("Resuming conversation", { id: conversationId });
     const snapshot = await this.store.load(conversationId);
     if (!snapshot) {
-      log7.error("Cannot resume: conversation not found", { id: conversationId });
+      log5.error("Cannot resume: conversation not found", { id: conversationId });
       return this.createResult(false, `Conversation ${conversationId} not found`, 0, "failed");
     }
     if (this.isRunning()) {
-      log7.warn("Cannot resume: conversation already running");
+      log5.warn("Cannot resume: conversation already running");
       return this.createResult(false, "Conversation already running", 0);
     }
     this.conversationId = snapshot.id;
@@ -2821,7 +2410,7 @@ ${tasksSummary || "- No tasks tracked"}
    */
   setAutoCheckpoint(enabled) {
     this.autoCheckpoint = enabled;
-    log7.debug("Auto-checkpoint", { enabled });
+    log5.debug("Auto-checkpoint", { enabled });
   }
   /**
    * Set a custom conversation store
@@ -2832,7 +2421,7 @@ ${tasksSummary || "- No tasks tracked"}
 };
 
 // src/kernel/TodoManager.ts
-var log8 = createLogger("TodoManager");
+var log6 = createLogger("TodoManager");
 var VALID_STATUSES = ["pending", "in_progress", "completed"];
 function validateTodo(todo) {
   if (!todo.content || todo.content.trim() === "") {
@@ -2853,42 +2442,42 @@ var TodoManager = class {
   isProcessingEvent = false;
   constructor(events) {
     this.events = events;
-    log8.info("TodoManager constructor - subscribing to todo:updated events");
+    log6.info("TodoManager constructor - subscribing to todo:updated events");
     this.events.on("todo:updated", (payload) => {
-      log8.info("TodoManager received todo:updated event", {
+      log6.info("TodoManager received todo:updated event", {
         isProcessingEvent: this.isProcessingEvent,
         payload
       });
       if (this.isProcessingEvent) {
-        log8.debug("Ignoring event - self-emitted");
+        log6.debug("Ignoring event - self-emitted");
         return;
       }
       const todos = payload.todos;
       this.handleExternalUpdate(todos);
     });
-    log8.info("TodoManager constructor complete - subscription active");
+    log6.info("TodoManager constructor complete - subscription active");
   }
   /**
    * Handle external todo updates (from ConversationEngine)
    * Updates internal state and notifies subscribers without re-emitting events
    */
   handleExternalUpdate(todos) {
-    log8.info("handleExternalUpdate called", { todoCount: todos.length, todos });
+    log6.info("handleExternalUpdate called", { todoCount: todos.length, todos });
     for (const todo of todos) {
       const error = validateTodo(todo);
       if (error) {
-        log8.warn("Invalid todo from external update", { error, todo });
+        log6.warn("Invalid todo from external update", { error, todo });
         return;
       }
     }
     const inProgress = todos.filter((t) => t.status === "in_progress");
     if (inProgress.length > 1) {
-      log8.warn("External update has multiple in_progress tasks");
+      log6.warn("External update has multiple in_progress tasks");
       return;
     }
     this.todos = todos.map((t) => ({ ...t }));
-    log8.info("Internal todos updated", { todoCount: this.todos.length });
-    log8.info("Notifying subscribers", { subscriberCount: this.subscribers.size });
+    log6.info("Internal todos updated", { todoCount: this.todos.length });
+    log6.info("Notifying subscribers", { subscriberCount: this.subscribers.size });
     this.notifySubscribers();
   }
   // ===========================================================================
@@ -3048,10 +2637,10 @@ var TodoManager = class {
    */
   subscribe(callback) {
     this.subscribers.add(callback);
-    log8.info("Subscriber added to TodoManager", { subscriberCount: this.subscribers.size });
+    log6.info("Subscriber added to TodoManager", { subscriberCount: this.subscribers.size });
     return () => {
       this.subscribers.delete(callback);
-      log8.info("Subscriber removed from TodoManager", { subscriberCount: this.subscribers.size });
+      log6.info("Subscriber removed from TodoManager", { subscriberCount: this.subscribers.size });
     };
   }
   // ===========================================================================
@@ -3091,11 +2680,6 @@ var AGENT_TYPE_CONFIGS = {
     allowedTools: ["Read", "Glob", "Grep", "LS"],
     systemPromptSuffix: "You are a fast exploration agent. Only use read-only tools."
   },
-  contract: {
-    defaultModel: "sonnet",
-    allowedTools: ["Read", "Glob", "Grep", "agent_ask_user", "vault_create_note", "submit_contract"],
-    systemPromptSuffix: "You are a contract planning agent. Generate Smart Contracts for goals."
-  },
   execute: {
     defaultModel: "sonnet",
     allowedTools: "*",
@@ -3115,11 +2699,6 @@ var AGENT_TYPE_CONFIGS = {
     defaultModel: "sonnet",
     allowedTools: ["Read", "Glob", "Grep", "WebFetch", "WebSearch"],
     systemPromptSuffix: "You are a planning agent. Design implementation strategies."
-  },
-  "contract-plan": {
-    defaultModel: "sonnet",
-    allowedTools: ["Read", "Glob", "Grep", "agent_ask_user", "vault_create_note", "submit_contract"],
-    systemPromptSuffix: "You are a contract planning agent. Generate Smart Contracts for goals."
   },
   Bash: {
     defaultModel: "sonnet",
@@ -3518,20 +3097,20 @@ var VerificationEngine = class {
 };
 
 // src/fs.ts
-var log9 = createLogger("Filesystem");
+var log7 = createLogger("Filesystem");
 var noopFilesystem = {
   async writeTextFile(path, _content) {
-    log9.debug("writeTextFile (no-op)", { path });
+    log7.debug("writeTextFile (no-op)", { path });
   },
   async readTextFile(path) {
-    log9.debug("readTextFile (no-op)", { path });
+    log7.debug("readTextFile (no-op)", { path });
     return "";
   },
   async mkdir(path, _options) {
-    log9.debug("mkdir (no-op)", { path });
+    log7.debug("mkdir (no-op)", { path });
   },
   async exists(path) {
-    log9.debug("exists (no-op)", { path });
+    log7.debug("exists (no-op)", { path });
     return false;
   }
 };
@@ -3560,7 +3139,7 @@ function createMemoryFilesystem() {
 var currentFilesystem = noopFilesystem;
 function setFilesystem(fs) {
   currentFilesystem = fs;
-  log9.info("Filesystem set");
+  log7.info("Filesystem set");
 }
 function getFilesystem() {
   return currentFilesystem;
@@ -4080,16 +3659,16 @@ function initDebugFlag() {
   }
 }
 initDebugFlag();
-var log10 = createLogger("VercelAILLMProvider");
+var log8 = createLogger("VercelAILLMProvider");
 var modelProvider = null;
 var toolRegistryProvider = null;
 function setModelProvider(provider) {
   modelProvider = provider;
-  log10.info("Model provider set");
+  log8.info("Model provider set");
 }
 function setToolRegistryProvider(provider) {
   toolRegistryProvider = provider;
-  log10.info("Tool registry provider set");
+  log8.info("Tool registry provider set");
 }
 function toCoreMess(messages) {
   return messages.map((msg) => {
@@ -4134,7 +3713,7 @@ function toCoreMess(messages) {
           ]
         };
       default:
-        log10.warn("Unknown message role, treating as user", { role: msg.role });
+        log8.warn("Unknown message role, treating as user", { role: msg.role });
         return { role: "user", content: msg.content };
     }
   });
@@ -4146,7 +3725,7 @@ function getToolsFromRegistry(toolNames) {
   const registryTools = toolRegistryProvider.getToolsForAI({
     ids: toolNames
   });
-  log10.info("Got tools from ToolRegistry", {
+  log8.info("Got tools from ToolRegistry", {
     count: Object.keys(registryTools).length,
     names: Object.keys(registryTools)
   });
@@ -4165,9 +3744,9 @@ function toCoreTools(tools) {
       inputSchema
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     });
-    log10.debug("Registered fallback tool", { name: toolDef.name });
+    log8.debug("Registered fallback tool", { name: toolDef.name });
   }
-  log10.info("Converted tools for LLM (fallback)", { count: tools.length });
+  log8.info("Converted tools for LLM (fallback)", { count: tools.length });
   return coreTools;
 }
 function extractToolCalls(toolCalls) {
@@ -4221,7 +3800,7 @@ var VercelAILLMProvider = class _VercelAILLMProvider {
       const toolNames = options.tools.map((t) => t.name);
       tools = getToolsFromRegistry(toolNames);
       if (Object.keys(tools).length === 0) {
-        log10.warn("No tools found in ToolRegistry, using fallback conversion");
+        log8.warn("No tools found in ToolRegistry, using fallback conversion");
         tools = toCoreTools(options.tools);
       }
     }
@@ -4272,7 +3851,7 @@ var VercelAILLMProvider = class _VercelAILLMProvider {
         }
         return total;
       }, 0);
-      log10.info("Calling generateText", {
+      log8.info("Calling generateText", {
         toolCount: generateOptions.tools ? Object.keys(generateOptions.tools).length : 0,
         messageCount: coreMessages.length,
         contextSizeChars: contextSize,
@@ -4303,10 +3882,10 @@ var VercelAILLMProvider = class _VercelAILLMProvider {
       };
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
-        log10.warn("LLM call aborted", { name: error.name });
+        log8.warn("LLM call aborted", { name: error.name });
         throw error;
       }
-      log10.error("LLM call failed", {
+      log8.error("LLM call failed", {
         message: error instanceof Error ? error.message : String(error),
         name: error instanceof Error ? error.name : "Unknown"
       });
@@ -4426,7 +4005,7 @@ function createDefaultLLMProvider() {
 }
 
 // src/AIOSService.ts
-var log11 = createLogger("AIOSService");
+var log9 = createLogger("AIOSService");
 function createStubLLMProvider() {
   return {
     id: "stub",
@@ -4465,19 +4044,19 @@ function createStubToolProvider() {
 function createStubUserInterface() {
   return {
     ask: async (request) => {
-      log11.warn("ask() called but no UI configured:", request.question);
+      log9.warn("ask() called but no UI configured:", request.question);
       return "No response (stub UI)";
     },
     askMultiple: async (questions) => {
-      log11.warn("askMultiple() called but no UI configured:", questions);
+      log9.warn("askMultiple() called but no UI configured:", questions);
       return {};
     },
     confirm: async (message) => {
-      log11.warn("confirm() called but no UI configured:", message);
+      log9.warn("confirm() called but no UI configured:", message);
       return false;
     },
     notify: (message, type) => {
-      log11.info(`[${type || "info"}]`, message);
+      log9.info(`[${type || "info"}]`, message);
     },
     isPending: () => false,
     cancel: () => {
@@ -4523,7 +4102,7 @@ var currentProviders = {
 };
 function setProviders(providers) {
   currentProviders = { ...currentProviders, ...providers };
-  log11.info("Providers updated");
+  log9.info("Providers updated");
 }
 function getProviders() {
   return currentProviders;
@@ -4539,18 +4118,18 @@ var AIOSService = class {
   // Providers - toolProvider is cached, llmProvider is created fresh each time
   toolProvider;
   constructor(config = {}) {
-    log11.info("AIOSService constructor starting");
+    log9.info("AIOSService constructor starting");
     this.config = config;
     this.providers = { ...currentProviders, ...config.providers };
     if (config.toolPatterns && config.toolPatterns.length > 0 && this.providers.createFilteredToolProvider) {
-      log11.info("Creating filtered tool provider", { patterns: config.toolPatterns });
+      log9.info("Creating filtered tool provider", { patterns: config.toolPatterns });
       this.toolProvider = this.providers.createFilteredToolProvider(config.toolPatterns);
     } else {
       this.toolProvider = this.providers.createToolProvider();
     }
-    log11.info("Getting event emitter");
+    log9.info("Getting event emitter");
     const events = this.providers.getEventEmitter();
-    log11.info("Creating TodoManager");
+    log9.info("Creating TodoManager");
     this.todoManager = new TodoManager(events);
     this.planManager = new PlanManager(events);
     const agentFactory = this.createAgentFactory();
@@ -4558,7 +4137,7 @@ var AIOSService = class {
     if (typeof window !== "undefined" && window.__aiosDebugEnabled) {
       installDebugStub();
     }
-    log11.info("AIOSService constructor complete");
+    log9.info("AIOSService constructor complete");
   }
   // ===========================================================================
   // PUBLIC API
@@ -4598,15 +4177,6 @@ var AIOSService = class {
       if (config.requireTodoWrite !== void 0) {
         mergedConfig.requireTodoWrite = config.requireTodoWrite;
       }
-      if (config.goalId !== void 0) {
-        mergedConfig.goalId = config.goalId;
-      }
-      if (config.goalName !== void 0) {
-        mergedConfig.goalName = config.goalName;
-      }
-      if (config.saveToGoalMemory !== void 0) {
-        mergedConfig.saveToGoalMemory = config.saveToGoalMemory;
-      }
     }
     if (this.config.requireTodoWrite !== void 0 && mergedConfig.requireTodoWrite === void 0) {
       mergedConfig.requireTodoWrite = this.config.requireTodoWrite;
@@ -4614,7 +4184,7 @@ var AIOSService = class {
     const enableMemoryContext = this.config.enableMemoryContext !== false;
     if (enableMemoryContext && this.providers.getMemoryContext && this.providers.buildEnhancedSystemPrompt) {
       try {
-        log11.info("Fetching memory context for conversation");
+        log9.info("Fetching memory context for conversation");
         const memoryContext = await this.providers.getMemoryContext(
           [{ role: "user", content: prompt }],
           {
@@ -4629,13 +4199,13 @@ var AIOSService = class {
             memoryContext,
             prompt
           );
-          log11.info("Enhanced system prompt built", {
+          log9.info("Enhanced system prompt built", {
             memoryCount: memoryContext.memories.length,
             hasProfile: !!memoryContext.userProfile
           });
         }
       } catch (error) {
-        log11.warn("Failed to build enhanced system prompt", { error });
+        log9.warn("Failed to build enhanced system prompt", { error });
       }
     }
     if (typeof window !== "undefined" && window.__aiosDebugEnabled) {
@@ -4643,13 +4213,12 @@ var AIOSService = class {
       const harness = new DebugHarness("pending", prompt, {
         maxTurns: mergedConfig.maxTurns,
         timeoutMs: mergedConfig.timeoutMs,
-        requireTodoWrite: mergedConfig.requireTodoWrite,
-        goalId: mergedConfig.goalId
+        requireTodoWrite: mergedConfig.requireTodoWrite
       });
       absorbPendingConfig(harness);
       this.conversationEngine.setDebugHarness(harness);
       window.__aiosDebug = harness.getConsoleAPI();
-      log11.info("Debug harness attached", { tracePath: harness.getConsoleAPI().getTracePath() });
+      log9.info("Debug harness attached", { tracePath: harness.getConsoleAPI().getTracePath() });
     }
     const result = await this.conversationEngine.execute(prompt, mergedConfig);
     return result;
@@ -4679,7 +4248,7 @@ var AIOSService = class {
     return this.todoManager.getProgress();
   }
   onTodosChange(callback) {
-    log11.info("onTodosChange called - subscribing to TodoManager");
+    log9.info("onTodosChange called - subscribing to TodoManager");
     return this.todoManager.subscribe(callback);
   }
   // ===========================================================================
@@ -4699,30 +4268,6 @@ var AIOSService = class {
   }
   onPlanChange(callback) {
     return this.planManager.subscribe(callback);
-  }
-  // ===========================================================================
-  // CONTRACT APPROVAL
-  // ===========================================================================
-  isPaused() {
-    return this.conversationEngine?.isPaused() ?? false;
-  }
-  async resumeWithApproval(contractPath) {
-    if (!this.conversationEngine) {
-      throw new Error("No conversation to resume");
-    }
-    return this.conversationEngine.resumeWithApproval(contractPath);
-  }
-  async resumeWithChanges(feedback) {
-    if (!this.conversationEngine) {
-      throw new Error("No conversation to resume");
-    }
-    return this.conversationEngine.resumeWithChanges(feedback);
-  }
-  async rejectContract(reason) {
-    if (!this.conversationEngine) {
-      throw new Error("No conversation to reject");
-    }
-    return this.conversationEngine.rejectContract(reason);
   }
   // ===========================================================================
   // SUB-AGENTS
@@ -4791,7 +4336,7 @@ var AIOSService = class {
 var defaultInstance = null;
 function getAIOSService() {
   if (!defaultInstance) {
-    log11.info("Creating new AIOSService singleton instance");
+    log9.info("Creating new AIOSService singleton instance");
     defaultInstance = new AIOSService();
   }
   return defaultInstance;
@@ -4806,6 +4351,26 @@ function resetAIOSService() {
   }
 }
 
-export { AIOSService, ContextCompressor, ConversationEngine, ConversationStore, DebugHarness, DecisionLogger, PlanManager, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, TaskSpawner, TodoManager, ToolRetryPolicy, VercelAILLMProvider, VerificationEngine, absorbPendingConfig, canSkipTodoWrite, classifyIntent, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getTodoWriteGuidance, getToolMetadata, goalContextProvider, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, needsClarification, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
+// src/backend.ts
+var log10 = createLogger("Backend");
+var noopBackend = {
+  async invoke(command, args) {
+    log10.debug("Backend invoke (no-op)", { command, args });
+    return null;
+  }
+};
+var currentBackend = noopBackend;
+function setBackend(backend) {
+  currentBackend = backend;
+  log10.info("Backend set", { hasInvoke: typeof backend.invoke === "function" });
+}
+function getBackend() {
+  return currentBackend;
+}
+async function invoke(command, args) {
+  return currentBackend.invoke(command, args);
+}
+
+export { AIOSService, ContextCompressor, ConversationEngine, ConversationStore, DebugHarness, DecisionLogger, PlanManager, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, TaskSpawner, TodoManager, ToolRetryPolicy, VercelAILLMProvider, VerificationEngine, absorbPendingConfig, canSkipTodoWrite, classifyIntent, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getTodoWriteGuidance, getToolMetadata, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, needsClarification, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
 //# sourceMappingURL=index.mjs.map
 //# sourceMappingURL=index.mjs.map

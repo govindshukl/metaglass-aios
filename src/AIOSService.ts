@@ -343,15 +343,6 @@ export class AIOSService {
       if (config.requireTodoWrite !== undefined) {
         mergedConfig.requireTodoWrite = config.requireTodoWrite;
       }
-      if (config.goalId !== undefined) {
-        mergedConfig.goalId = config.goalId;
-      }
-      if (config.goalName !== undefined) {
-        mergedConfig.goalName = config.goalName;
-      }
-      if (config.saveToGoalMemory !== undefined) {
-        mergedConfig.saveToGoalMemory = config.saveToGoalMemory;
-      }
     }
 
     // Apply service-level overrides for TodoWrite
@@ -397,7 +388,6 @@ export class AIOSService {
         maxTurns: mergedConfig.maxTurns,
         timeoutMs: mergedConfig.timeoutMs,
         requireTodoWrite: mergedConfig.requireTodoWrite,
-        goalId: mergedConfig.goalId,
       });
 
       absorbPendingConfig(harness);
@@ -467,35 +457,6 @@ export class AIOSService {
 
   onPlanChange(callback: (state: PlanState) => void): () => void {
     return this.planManager.subscribe(callback);
-  }
-
-  // ===========================================================================
-  // CONTRACT APPROVAL
-  // ===========================================================================
-
-  isPaused(): boolean {
-    return this.conversationEngine?.isPaused() ?? false;
-  }
-
-  async resumeWithApproval(contractPath: string): Promise<ConversationResult> {
-    if (!this.conversationEngine) {
-      throw new Error('No conversation to resume');
-    }
-    return this.conversationEngine.resumeWithApproval(contractPath);
-  }
-
-  async resumeWithChanges(feedback: string): Promise<ConversationResult> {
-    if (!this.conversationEngine) {
-      throw new Error('No conversation to resume');
-    }
-    return this.conversationEngine.resumeWithChanges(feedback);
-  }
-
-  async rejectContract(reason?: string): Promise<ConversationResult> {
-    if (!this.conversationEngine) {
-      throw new Error('No conversation to reject');
-    }
-    return this.conversationEngine.rejectContract(reason);
   }
 
   // ===========================================================================
