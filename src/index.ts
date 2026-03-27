@@ -31,13 +31,6 @@ export type { RetryResult, RetryOptions } from './kernel/ToolRetryPolicy';
 export { DecisionLogger } from './kernel/DecisionLogger';
 export type { DecisionLog, DecisionType } from './kernel/DecisionLogger';
 
-export {
-  classifyIntent,
-  canSkipTodoWrite,
-  needsClarification,
-} from './kernel/IntentClassifier';
-export type { ClassificationResult, KernelLLMClassifyFn } from './kernel/IntentClassifier';
-
 export { VerificationEngine } from './kernel/VerificationEngine';
 
 export {
@@ -49,8 +42,6 @@ export {
   TOOL_METADATA,
 } from './kernel/ToolMetadataRegistry';
 export type { ToolMetadata, MetadataCategory, SideEffects, CostLevel } from './kernel/ToolMetadataRegistry';
-
-export { getTodoWriteGuidance } from './kernel/TodoWriteGuidance';
 
 export {
   filterExemptTools,

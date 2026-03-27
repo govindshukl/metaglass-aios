@@ -47,109 +47,94 @@ var log = createLogger("ContextCompressor");
 var DEFAULT_CONFIG = {
   enabled: true,
   maxTokens: 1e5,
-  summarizeThreshold: 10,
+  summarizeThreshold: 5,
+  // Compress every 5 turns (rolling, not cliff)
   preserveRecentTurns: 5,
+  // Always keep last 5 turns verbatim
   charsPerToken: 4,
-  summaryMaxTokens: 1e3
+  summaryMaxTokens: 500
+  // Each rolling summary is concise
 };
-var SUMMARIZATION_PROMPT = `You are summarizing a conversation between a user and an AI assistant.
-Summarize the following conversation turns, preserving:
-1. Key decisions and actions taken
-2. Important information discovered
-3. Tools called and their significant results
-4. Any user preferences or clarifications
+var SUMMARIZATION_PROMPT = `Summarize these conversation turns as structured bullet points. Preserve:
+- Key decisions made
+- Facts discovered (with specific values/names)
+- Actions taken and their outcomes
+- User preferences expressed
 
-Be concise but preserve essential context. Format as a brief narrative.`;
+Use bullet points, not prose. Be concise \u2014 max 10 bullets.`;
 var ContextCompressor = class {
   llm;
   config;
+  /** Count of unsummarized turns since last compression */
+  unsummarizedTurnCount = 0;
   constructor(llm, config) {
     this.llm = llm;
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
   /**
-   * Compress conversation history if needed
+   * Compress conversation history using rolling summarization.
    *
-   * @param history - Full conversation history
-   * @param systemPrompt - Optional system prompt (counted separately)
-   * @returns Compressed history with metadata
+   * Called every turn. Checks two conditions:
+   * 1. Have N new turns accumulated since last compression? → Summarize them
+   * 2. Are we over the token budget? → Force-compress oldest unsummarized block
    */
   async compress(history, systemPrompt) {
     if (!this.config.enabled) {
-      return {
-        messages: history,
-        originalTokens: this.estimateTokens(history),
-        compressedTokens: this.estimateTokens(history),
-        summarizedTurns: 0,
-        wasCompressed: false
-      };
+      return this.noCompression(history);
     }
     const originalTokens = this.estimateTokens(history) + (systemPrompt ? this.estimateMessageTokens(systemPrompt) : 0);
-    if (originalTokens < this.config.maxTokens * 0.7) {
-      log.debug("Compression not needed", { originalTokens, threshold: this.config.maxTokens * 0.7 });
-      return {
-        messages: history,
-        originalTokens,
-        compressedTokens: originalTokens,
-        summarizedTurns: 0,
-        wasCompressed: false
-      };
-    }
     const { systemMessages, userMessage, turns } = this.parseHistory(history);
-    if (turns.length < this.config.summarizeThreshold) {
-      log.debug("Not enough turns to compress", { turns: turns.length, threshold: this.config.summarizeThreshold });
-      return {
-        messages: history,
-        originalTokens,
-        compressedTokens: originalTokens,
-        summarizedTurns: 0,
-        wasCompressed: false
-      };
+    const unsummarizedTurns = turns.filter((t) => !t.isSummary);
+    const summaryTurns = turns.filter((t) => t.isSummary);
+    const preserveCount = Math.min(this.config.preserveRecentTurns, unsummarizedTurns.length);
+    const turnsToPreserve = unsummarizedTurns.slice(-preserveCount);
+    const turnsToMaybeSummarize = unsummarizedTurns.slice(0, unsummarizedTurns.length - preserveCount);
+    const shouldCompress = turnsToMaybeSummarize.length >= this.config.summarizeThreshold || originalTokens >= this.config.maxTokens * 0.7;
+    if (!shouldCompress || turnsToMaybeSummarize.length === 0) {
+      return this.noCompression(history);
     }
-    const preserveCount = Math.min(this.config.preserveRecentTurns, turns.length);
-    const turnsToSummarize = turns.slice(0, turns.length - preserveCount);
-    const turnsToPreserve = turns.slice(-preserveCount);
-    if (turnsToSummarize.length === 0) {
-      return {
-        messages: history,
-        originalTokens,
-        compressedTokens: originalTokens,
-        summarizedTurns: 0,
-        wasCompressed: false
-      };
-    }
-    log.info("Compressing context", {
+    log.info("Rolling compression triggered", {
       totalTurns: turns.length,
-      summarizing: turnsToSummarize.length,
-      preserving: preserveCount
+      unsummarized: unsummarizedTurns.length,
+      summarizing: turnsToMaybeSummarize.length,
+      preserving: preserveCount,
+      existingSummaries: summaryTurns.length,
+      originalTokens
     });
-    const summary = await this.summarizeTurns(turnsToSummarize);
+    const summary = await this.summarizeTurns(turnsToMaybeSummarize);
     const compressedHistory = [
       ...systemMessages,
       ...userMessage ? [userMessage] : [],
+      // Existing summaries from previous compressions (preserved as-is)
+      ...summaryTurns.flatMap((t) => t.messages),
+      // New rolling summary
       {
         role: "assistant",
-        content: `[Previous conversation summary: ${summary}]`
+        content: `[Summary of turns ${turnsToMaybeSummarize[0].index + 1}-${turnsToMaybeSummarize[turnsToMaybeSummarize.length - 1].index + 1}]
+${summary}`
       },
+      // Recent turns verbatim
       ...turnsToPreserve.flatMap((t) => t.messages)
     ];
     const compressedTokens = this.estimateTokens(compressedHistory) + (systemPrompt ? this.estimateMessageTokens(systemPrompt) : 0);
-    log.info("Context compressed", {
+    log.info("Rolling compression complete", {
       originalTokens,
       compressedTokens,
       reduction: `${Math.round((1 - compressedTokens / originalTokens) * 100)}%`,
-      summarizedTurns: turnsToSummarize.length
+      summarizedTurns: turnsToMaybeSummarize.length,
+      totalSummaries: summaryTurns.length + 1
     });
     return {
       messages: compressedHistory,
       originalTokens,
       compressedTokens,
-      summarizedTurns: turnsToSummarize.length,
+      summarizedTurns: turnsToMaybeSummarize.length,
       wasCompressed: true
     };
   }
   /**
-   * Parse history into system messages, initial user message, and turns
+   * Parse history into system messages, initial user message, and turns.
+   * Recognizes previous summary messages (prefixed with [Summary of turns ...]).
    */
   parseHistory(history) {
     const systemMessages = [];
@@ -168,10 +153,12 @@ var ContextCompressor = class {
       }
       if (msg.role === "assistant") {
         if (currentTurn.length > 0) {
+          const isSummary = currentTurn[0].content?.startsWith("[Summary of turns") || currentTurn[0].content?.startsWith("[Previous conversation summary");
           turns.push({
             index: turnIndex++,
             messages: currentTurn,
-            tokenCount: this.estimateTokens(currentTurn)
+            tokenCount: this.estimateTokens(currentTurn),
+            isSummary
           });
         }
         currentTurn = [msg];
@@ -180,16 +167,18 @@ var ContextCompressor = class {
       }
     }
     if (currentTurn.length > 0) {
+      const isSummary = currentTurn[0].content?.startsWith("[Summary of turns") || currentTurn[0].content?.startsWith("[Previous conversation summary");
       turns.push({
         index: turnIndex,
         messages: currentTurn,
-        tokenCount: this.estimateTokens(currentTurn)
+        tokenCount: this.estimateTokens(currentTurn),
+        isSummary
       });
     }
     return { systemMessages, userMessage, turns };
   }
   /**
-   * Generate a summary of conversation turns
+   * Generate a structured bullet-point summary of conversation turns
    */
   async summarizeTurns(turns) {
     const turnTexts = turns.map((turn) => {
@@ -198,32 +187,28 @@ var ContextCompressor = class {
         if (msg.role === "assistant") {
           if (msg.toolCalls && msg.toolCalls.length > 0) {
             const toolNames = msg.toolCalls.map((tc) => tc.name).join(", ");
-            parts.push(`Assistant called tools: ${toolNames}`);
+            parts.push(`Called: ${toolNames}`);
           }
           if (msg.content) {
-            const preview = msg.content.slice(0, 200);
-            parts.push(`Assistant: ${preview}${msg.content.length > 200 ? "..." : ""}`);
+            parts.push(`Said: ${msg.content.slice(0, 150)}${msg.content.length > 150 ? "..." : ""}`);
           }
         } else if (msg.role === "tool") {
-          const preview = msg.content.slice(0, 100);
-          const toolName = msg.toolName || "tool";
-          parts.push(`${toolName} result: ${preview}${msg.content.length > 100 ? "..." : ""}`);
+          const preview = msg.content.slice(0, 80);
+          parts.push(`${msg.toolName || "tool"}: ${preview}${msg.content.length > 80 ? "..." : ""}`);
         } else if (msg.role === "user") {
-          parts.push(`User: ${msg.content.slice(0, 150)}`);
+          parts.push(`User: ${msg.content.slice(0, 100)}`);
         }
       }
-      return `Turn ${turn.index + 1}:
-${parts.join("\n")}`;
+      return `Turn ${turn.index + 1}: ${parts.join(" | ")}`;
     });
-    const conversationToSummarize = turnTexts.join("\n\n");
+    const conversationToSummarize = turnTexts.join("\n");
     try {
       const response = await this.llm.chat([
         { role: "system", content: SUMMARIZATION_PROMPT },
         { role: "user", content: conversationToSummarize }
       ], {
         maxTokens: this.config.summaryMaxTokens,
-        temperature: 0.3
-        // Lower temperature for consistent summaries
+        temperature: 0.2
       });
       return response.content;
     } catch (error) {
@@ -231,8 +216,24 @@ ${parts.join("\n")}`;
       const toolCalls = turns.flatMap(
         (t) => t.messages.filter((m) => m.toolCalls).flatMap((m) => m.toolCalls.map((tc) => tc.name))
       );
-      return `Previous conversation included ${turns.length} turns with tools: ${[...new Set(toolCalls)].join(", ")}`;
+      const uniqueTools = [...new Set(toolCalls)];
+      return `- ${turns.length} turns completed
+- Tools used: ${uniqueTools.join(", ")}
+- Results obtained and processed`;
     }
+  }
+  /**
+   * Return no-compression result
+   */
+  noCompression(history) {
+    const tokens = this.estimateTokens(history);
+    return {
+      messages: history,
+      originalTokens: tokens,
+      compressedTokens: tokens,
+      summarizedTurns: 0,
+      wasCompressed: false
+    };
   }
   /**
    * Estimate token count for a list of messages
@@ -823,218 +824,6 @@ function filterActionTools(toolCalls) {
   return toolCalls.filter((tc) => !isToolExemptFromTodoWrite(tc.name));
 }
 
-// src/kernel/IntentClassifier.ts
-var log4 = createLogger("IntentClassifier");
-var CREATE_VERBS = /\b(create|build|make|implement|design|develop|write|generate|compose|draft|prepare|schedule|plan|organize)\b/i;
-var QUERY_VERBS = /\b(find|search|look\s+up|where\s+is|show\s+me|list|get|fetch)\b/i;
-var TRIVIAL_QUESTION = /^(what\s+is|how\s+do|what\s+are)\s+\w+(\s+\w+)?[?!.]*$/i;
-var AMBIGUITY_INDICATORS = /\b(something|stuff|things|etc|maybe|probably|perhaps|might|could\s+be|not\s+sure|somehow)\b/i;
-var GREETING_PATTERNS = /^(hi|hello|hey|thanks|thank\s+you|good\s+(morning|afternoon|evening)|yo|sup|bye|goodbye|ok|okay|sure|yes|no|yeah|nope|yep)[\s!.?]*$/i;
-var SUBJECTIVE_TASK_PATTERNS = /\b(plan|guide|schedule|routine|program|curriculum|roadmap|strategy|approach)\b/i;
-var KERNEL_CLASSIFICATION_SYSTEM_PROMPT = `You are a task complexity classifier for an AI assistant that manages a knowledge base. Your job is to analyze a user's goal and classify its complexity level.
-
-## Complexity Levels
-
-1. **trivial** - No tools needed, direct conversational response.
-   - Greetings: "hello", "hi", "thanks", "bye"
-   - Simple factual questions: "what is 2+2", "what is a mutex"
-   - Acknowledgments: "ok", "sure", "yes", "no"
-   - Very short inputs (<15 chars) without action verbs
-
-2. **simple_query** - Single read-only tool call, no planning needed.
-   - Search/find patterns: "find notes about React", "search for meeting notes"
-   - Show/list patterns: "show me my recent notes", "list files about ML"
-   - Lookup patterns: "where is the config file", "look up API docs"
-
-3. **multi_step** - Requires planning and multiple tool calls (creation, modification, multi-phase work).
-   - Creation: "create a note about project planning", "write a summary of my research"
-   - Modification: "update my study notes with new findings"
-   - Planning: "plan a trip to Dubai", "build a learning roadmap"
-   - Composition: "generate a weekly review from my notes"
-
-4. **complex** - Ambiguous, has multiple deliverables (3+), requires clarification, or involves subjective decisions with unclear scope.
-   - Ambiguous language: "help me with some stuff", "maybe create something about things"
-   - Multiple deliverables: "create a plan, build a tracker, and write documentation"
-   - Very long goals (100+ chars) with unclear scope
-   - Broad/vague requests: "organize everything", "fix all my notes"
-
-## Suggested Actions
-
-Based on complexity, include zero or more actions:
-- "ask_clarification" \u2014 goal is ambiguous, subjective (plans, guides, schedules, routines), or needs user preferences before proceeding
-- "create_todo" \u2014 task has multiple steps that should be tracked
-- "checkpoint_before_execution" \u2014 task is complex enough to warrant verification before executing
-- "verify_output" \u2014 output should be verified against the original goal
-
-Rules:
-- trivial: no actions, confidence 0.90-0.95
-- simple_query: no actions, confidence 0.85-0.95
-- multi_step: always include "create_todo"; add "ask_clarification" if the goal is subjective or preference-based; confidence 0.75-0.90
-- complex: include all four actions; confidence 0.50-0.75 (lower when ambiguity is present)
-
-## Conversation Context
-
-You may receive recent conversation history. Use it to disambiguate:
-- Short follow-ups like "do it" or "yes" should be classified based on what was discussed
-- Multi-turn context reveals whether a request is part of a larger task
-
-## Response Format
-
-Respond with ONLY a JSON object. No markdown fences, no explanation, no text before or after:
-{"complexity":"<level>","confidence":<0.0-1.0>,"suggestedActions":[<actions>],"reasoning":"<brief explanation>"}`;
-function buildKernelClassificationPrompt(goal, conversationHistory) {
-  let prompt = "";
-  const recentHistory = conversationHistory.filter((m) => m.role === "user" || m.role === "assistant").slice(-6).map((m) => `${m.role}: ${m.content.substring(0, 200)}`);
-  if (recentHistory.length > 0) {
-    prompt += `## Recent Conversation
-${recentHistory.join("\n")}
-
-`;
-  }
-  prompt += `## Current User Goal
-"${goal}"
-
-Classify this goal.`;
-  return prompt;
-}
-var VALID_COMPLEXITIES = /* @__PURE__ */ new Set(["trivial", "simple_query", "multi_step", "complex"]);
-var VALID_ACTIONS = /* @__PURE__ */ new Set([
-  "ask_clarification",
-  "create_todo",
-  "checkpoint_before_execution",
-  "verify_output"
-]);
-var COMPLEXITY_MAP = {
-  "trivial": "trivial" /* TRIVIAL */,
-  "simple_query": "simple_query" /* SIMPLE_QUERY */,
-  "multi_step": "multi_step" /* MULTI_STEP */,
-  "complex": "complex" /* COMPLEX */
-};
-function parseClassificationResponse(content) {
-  const cleaned = content.replace(/```json?\s*/gi, "").replace(/```\s*/g, "").trim();
-  const parsed = JSON.parse(cleaned);
-  if (!parsed.complexity || !VALID_COMPLEXITIES.has(parsed.complexity)) {
-    throw new Error(`Invalid complexity value: "${parsed.complexity}". Expected one of: ${[...VALID_COMPLEXITIES].join(", ")}`);
-  }
-  const complexity = COMPLEXITY_MAP[parsed.complexity];
-  const confidence = typeof parsed.confidence === "number" ? Math.max(0, Math.min(1, parsed.confidence)) : 0.7;
-  const suggestedActions = Array.isArray(parsed.suggestedActions) ? parsed.suggestedActions.filter((a) => VALID_ACTIONS.has(a)) : [];
-  const reasoning = typeof parsed.reasoning === "string" && parsed.reasoning.length > 0 ? `LLM: ${parsed.reasoning}` : `LLM classified as ${parsed.complexity}`;
-  return {
-    complexity,
-    confidence,
-    suggestedActions,
-    reasoning
-  };
-}
-function classifyIntentRegex(goal, _conversationHistory) {
-  const trimmedGoal = goal.trim();
-  const goalLength = trimmedGoal.length;
-  const hasCreateVerb = CREATE_VERBS.test(trimmedGoal);
-  const hasQueryVerb = QUERY_VERBS.test(trimmedGoal);
-  const hasAmbiguity = AMBIGUITY_INDICATORS.test(trimmedGoal);
-  const isGreeting = GREETING_PATTERNS.test(trimmedGoal);
-  const isTrivialQuestion = TRIVIAL_QUESTION.test(trimmedGoal);
-  const isSubjectiveTask = SUBJECTIVE_TASK_PATTERNS.test(trimmedGoal);
-  const commaCount = (trimmedGoal.match(/,/g) || []).length;
-  const andCount = (trimmedGoal.match(/\band\b/gi) || []).length;
-  const deliverableCount = commaCount + andCount + 1;
-  let complexity;
-  const suggestedActions = [];
-  let confidence = 0.85;
-  let reasoning;
-  if (goalLength === 0 || isGreeting || isTrivialQuestion || goalLength < 15 && !hasCreateVerb && !hasQueryVerb) {
-    complexity = "trivial" /* TRIVIAL */;
-    reasoning = `Trivial input: ${isGreeting ? "greeting detected" : goalLength === 0 ? "empty input" : isTrivialQuestion ? "trivial question" : "very short input without action verbs"}`;
-    confidence = 0.95;
-  } else if (hasAmbiguity || deliverableCount >= 3 || goalLength > 100) {
-    complexity = "complex" /* COMPLEX */;
-    suggestedActions.push("ask_clarification", "create_todo", "checkpoint_before_execution", "verify_output");
-    const reasons = [];
-    if (hasAmbiguity) reasons.push("ambiguous language detected");
-    if (deliverableCount >= 3) reasons.push(`${deliverableCount} potential deliverables`);
-    if (goalLength > 100) reasons.push(`long goal (${goalLength} chars)`);
-    reasoning = `Complex task: ${reasons.join(", ")}`;
-    confidence = hasAmbiguity ? 0.6 : 0.75;
-  } else if (hasCreateVerb) {
-    complexity = "multi_step" /* MULTI_STEP */;
-    suggestedActions.push("create_todo");
-    if (hasAmbiguity || isSubjectiveTask) {
-      suggestedActions.unshift("ask_clarification");
-      confidence = hasAmbiguity ? 0.7 : 0.8;
-    }
-    reasoning = `Multi-step task: detected creation verb${hasAmbiguity ? " with ambiguity" : isSubjectiveTask ? " (subjective/preference-based)" : ""}`;
-  } else if (hasQueryVerb) {
-    complexity = "simple_query" /* SIMPLE_QUERY */;
-    reasoning = `Simple query: detected query verb (${trimmedGoal.match(QUERY_VERBS)?.[0] || "query"})`;
-    confidence = 0.9;
-  } else if (goalLength >= 15 && goalLength <= 50) {
-    complexity = "simple_query" /* SIMPLE_QUERY */;
-    reasoning = `Defaulting to simple query: medium-length input (${goalLength} chars) without clear action indicators`;
-    confidence = 0.65;
-  } else {
-    complexity = "multi_step" /* MULTI_STEP */;
-    suggestedActions.push("create_todo");
-    reasoning = `Defaulting to multi-step: longer input (${goalLength} chars) may require planning`;
-    confidence = 0.6;
-  }
-  return {
-    complexity,
-    confidence,
-    suggestedActions,
-    reasoning
-  };
-}
-async function classifyIntentLLM(goal, conversationHistory, llmFn) {
-  const messages = [
-    { role: "system", content: KERNEL_CLASSIFICATION_SYSTEM_PROMPT },
-    { role: "user", content: buildKernelClassificationPrompt(goal, conversationHistory) }
-  ];
-  const response = await llmFn(messages, { maxTokens: 256, temperature: 0 });
-  return parseClassificationResponse(response.content);
-}
-async function classifyIntent(goal, conversationHistory, llmFn) {
-  const regexResult = classifyIntentRegex(goal);
-  if (regexResult.confidence >= 0.9 && (regexResult.complexity === "trivial" /* TRIVIAL */ || regexResult.complexity === "simple_query" /* SIMPLE_QUERY */)) {
-    log4.debug("Intent classified via regex fast path", {
-      complexity: regexResult.complexity,
-      confidence: regexResult.confidence
-    });
-    return regexResult;
-  }
-  if (!llmFn) {
-    log4.debug("No LLM function provided, using regex classification", {
-      complexity: regexResult.complexity
-    });
-    return regexResult;
-  }
-  try {
-    log4.debug("Classifying intent via LLM", { goalPreview: goal.substring(0, 80) });
-    const llmResult = await classifyIntentLLM(goal, conversationHistory, llmFn);
-    log4.info("Intent classified via LLM", {
-      complexity: llmResult.complexity,
-      confidence: llmResult.confidence,
-      suggestedActions: llmResult.suggestedActions
-    });
-    return llmResult;
-  } catch (error) {
-    log4.warn("LLM classification failed, falling back to regex", {
-      error: error instanceof Error ? error.message : String(error),
-      regexComplexity: regexResult.complexity
-    });
-    return {
-      ...regexResult,
-      reasoning: `${regexResult.reasoning} (LLM fallback: ${error instanceof Error ? error.message : "unknown error"})`
-    };
-  }
-}
-function canSkipTodoWrite(classification) {
-  return classification.complexity === "trivial" /* TRIVIAL */ || classification.complexity === "simple_query" /* SIMPLE_QUERY */;
-}
-function needsClarification(classification) {
-  return classification.suggestedActions.includes("ask_clarification");
-}
-
 // src/kernel/DecisionLogger.ts
 var DecisionLogger = class {
   logs = [];
@@ -1308,6 +1097,26 @@ var TOOL_METADATA = {
     allowsParallelExecution: true
   },
   // ===========================================================================
+  // SUB-AGENT TOOLS - Spawning is expensive, CAN be parallelized
+  // ===========================================================================
+  spawn_task: {
+    category: "execution",
+    sideEffects: "reversible",
+    requiresConfirmation: false,
+    requiresTodoWrite: false,
+    costLevel: "expensive",
+    allowsParallelExecution: true
+    // Multiple sub-agents can run concurrently
+  },
+  task_status: {
+    category: "query",
+    sideEffects: "none",
+    requiresConfirmation: false,
+    requiresTodoWrite: false,
+    costLevel: "cheap",
+    allowsParallelExecution: true
+  },
+  // ===========================================================================
   // WEB TOOLS - External API calls, can be parallelized
   // ===========================================================================
   web_search: {
@@ -1354,45 +1163,100 @@ function partitionToolCalls(toolCalls) {
   return { parallel, sequential };
 }
 
-// src/kernel/TodoWriteGuidance.ts
-var SOFT_MESSAGE = "Consider using TodoWrite to track progress and give the user visibility into your work.";
-var STRONG_MESSAGE = "This task has multiple steps. Please use TodoWrite to plan and track your progress.";
-function getTodoWriteGuidance(input) {
-  const { complexity, turnNumber, hasProducedOutput } = input;
-  if (hasProducedOutput) {
-    return { level: "none", message: null };
-  }
-  if (complexity === "trivial" /* TRIVIAL */ || complexity === "simple_query" /* SIMPLE_QUERY */) {
-    return { level: "none", message: null };
-  }
-  if (complexity === "multi_step" /* MULTI_STEP */) {
-    if (turnNumber <= 2) {
-      return { level: "soft", message: SOFT_MESSAGE };
-    }
-    return { level: "none", message: null };
-  }
-  if (complexity === "complex" /* COMPLEX */) {
-    if (turnNumber === 1) {
-      return { level: "strong", message: STRONG_MESSAGE };
-    }
-    if (turnNumber <= 3) {
-      return { level: "soft", message: SOFT_MESSAGE };
-    }
-    return { level: "none", message: null };
-  }
-  return { level: "none", message: null };
-}
-
 // src/kernel/ConversationEngine.ts
-var log5 = createLogger("ConversationEngine");
+var log4 = createLogger("ConversationEngine");
 var DEFAULT_CONFIG4 = {
   maxTurns: 50,
   timeoutMs: 6e5,
   // 10 minutes (increased from 5 min to handle slow LLM responses)
   maxTokensPerTurn: 4096,
-  requireTodoWrite: true
+  requireTodoWrite: false,
+  // System prompt guides TodoWrite usage — no classifier gating
+  parallelTools: true
 };
-var ConversationEngine = class {
+var ACTIVE_TOOLS = /* @__PURE__ */ new Set([
+  // Search & Read
+  "search_hybrid",
+  // Meta
+  "batch_tools",
+  "vault_read_note",
+  "vault_open_note",
+  // Create & Edit
+  "vault_create_note",
+  "vault_update_note",
+  "vault_set_frontmatter",
+  // Agent interaction
+  "agent_ask_user",
+  "agent_confirm",
+  // Task management
+  "TodoWrite",
+  // Memory
+  "memory_store",
+  "memory_recall",
+  "memory_search",
+  // Shell (merged conceptually, but kept as individual tools for now)
+  "Glob",
+  "Grep",
+  "Read",
+  "Bash",
+  // Web
+  "web_search",
+  "web_fetch"
+]);
+var SUBAGENT_TOOL_DEFINITIONS = [
+  {
+    id: "spawn_task",
+    name: "spawn_task",
+    description: 'Spawn a sub-agent for a focused subtask. Use "explore" (haiku, read-only) for searching/reading notes. Use "skill" (sonnet, read-only) for skill execution. Call multiple times in one turn for parallel execution.',
+    parameters: {
+      type: "object",
+      properties: {
+        description: { type: "string", description: "Short summary of the task (3-5 words)" },
+        prompt: { type: "string", description: "Detailed task instructions for the sub-agent" },
+        subagentType: {
+          type: "string",
+          enum: [
+            "explore",
+            "Skill"
+            // Inactive — uncomment to re-enable:
+            // 'execute',
+            // 'Plan',
+            // 'Bash',
+            // 'general-purpose',
+          ],
+          description: "Type of sub-agent to spawn"
+        }
+        // model override inactive — uncomment to re-enable:
+        // model: {
+        //   type: 'string',
+        //   enum: ['haiku', 'sonnet', 'opus'],
+        //   description: 'Override the default model tier for this agent type',
+        // },
+        // runInBackground: {
+        //   type: 'boolean',
+        //   description: 'If true, spawn in background. Use task_status to check results later.',
+        // },
+      },
+      required: ["description", "prompt", "subagentType"]
+    },
+    category: "agent"
+  },
+  {
+    id: "task_status",
+    name: "task_status",
+    description: "Check the status or get the result of a background sub-agent task. Use after spawning a task with runInBackground: true.",
+    parameters: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "The task ID returned from spawn_task" },
+        wait: { type: "boolean", description: "If true, block until the task completes. Default: false." }
+      },
+      required: ["taskId"]
+    },
+    category: "agent"
+  }
+];
+var ConversationEngine = class _ConversationEngine {
   llm;
   tools;
   ui;
@@ -1416,8 +1280,6 @@ var ConversationEngine = class {
   store;
   currentTurn = 0;
   autoCheckpoint = false;
-  // Intent classification (Phase 7)
-  intentClassification = null;
   // Decision logger for observability
   decisionLogger;
   // Track tool results for session summary
@@ -1430,22 +1292,29 @@ var ConversationEngine = class {
   lastConfig = null;
   // Debug harness (optional — zero overhead when not attached)
   debugHarness = null;
-  // LLM function for intent classification (optional — uses regex fallback if not provided)
-  llmClassifyFn;
+  // Sub-agent spawning (optional — enables spawn_task/task_status tools)
+  taskSpawner = null;
+  // Base system prompt (immutable) — state is appended dynamically each turn
+  baseSystemPrompt = "";
+  // Loop detection state
+  recentToolSignatures = [];
+  // Tool call signatures per turn (last N turns)
+  lastActiveTodosSnapshot = "";
+  // Serialized active todos for stale detection
+  staleTodoTurns = 0;
+  // Consecutive turns with unchanged active todos
+  static LOOP_DETECTION_WINDOW = 4;
+  // Check last N turns for repetition
+  static STALE_TODO_THRESHOLD = 3;
+  // Nudge after N stale turns
+  static STALE_TODO_FORCE_STOP = 6;
+  // Force-stop after N stale turns
   constructor(deps) {
     this.llm = deps.llm;
     this.tools = deps.tools;
     this.ui = deps.ui;
     this.events = deps.events;
-    if (deps.classifierLlm) {
-      this.llmClassifyFn = async (messages, options) => {
-        const response = await deps.classifierLlm.chat(messages, {
-          maxTokens: options?.maxTokens ?? 256,
-          temperature: options?.temperature ?? 0
-        });
-        return { content: response.content };
-      };
-    }
+    this.taskSpawner = deps.taskSpawner ?? null;
     this.contextCompressor = new ContextCompressor(this.llm);
     this.retryPolicy = new ToolRetryPolicy();
     this.store = conversationStore;
@@ -1468,9 +1337,9 @@ var ConversationEngine = class {
    * Execute a conversation with the given prompt
    */
   async execute(prompt, config) {
-    log5.info("Execute called", { promptLength: prompt.length, hasConfig: !!config });
+    log4.info("Execute called", { promptLength: prompt.length, hasConfig: !!config });
     if (this.isRunning()) {
-      log5.warn("Conversation already running");
+      log4.warn("Conversation already running");
       return this.createResult(false, "Conversation already running", 0);
     }
     const cfg = {
@@ -1479,12 +1348,13 @@ var ConversationEngine = class {
       ...config?.timeoutMs !== void 0 ? { timeoutMs: config.timeoutMs } : {},
       ...config?.maxTokensPerTurn !== void 0 ? { maxTokensPerTurn: config.maxTokensPerTurn } : {},
       ...config?.requireTodoWrite !== void 0 ? { requireTodoWrite: config.requireTodoWrite } : {},
+      ...config?.parallelTools !== void 0 ? { parallelTools: config.parallelTools } : {},
       // These don't have defaults in DEFAULT_CONFIG
       systemPrompt: config?.systemPrompt,
       signal: config?.signal,
       compression: config?.compression
     };
-    log5.info("Merged config", { maxTurns: cfg.maxTurns, timeoutMs: cfg.timeoutMs, requireTodoWrite: cfg.requireTodoWrite });
+    log4.info("Merged config", { maxTurns: cfg.maxTurns, timeoutMs: cfg.timeoutMs, requireTodoWrite: cfg.requireTodoWrite });
     this.lastConfig = cfg;
     this.history = [];
     this.status = "running";
@@ -1502,47 +1372,23 @@ var ConversationEngine = class {
       hasSystemPrompt: !!cfg.systemPrompt
     });
     if (cfg.systemPrompt) {
+      this.baseSystemPrompt = cfg.systemPrompt;
       this.history.push({ role: "system", content: cfg.systemPrompt });
-      log5.debug("Added system prompt", { length: cfg.systemPrompt.length });
+      log4.debug("Added system prompt", { length: cfg.systemPrompt.length });
     } else {
-      log5.warn("No system prompt provided - LLM may not use tools effectively");
+      log4.warn("No system prompt provided - LLM may not use tools effectively");
     }
     this.history.push({ role: "user", content: prompt });
     this.originalGoal = prompt;
-    this.intentClassification = await classifyIntent(prompt, this.history, this.llmClassifyFn);
-    log5.info("Intent classified", {
-      complexity: this.intentClassification.complexity,
-      confidence: this.intentClassification.confidence,
-      suggestedActions: this.intentClassification.suggestedActions
-    });
     await this.events.emit("conversation:intent-classified", {
-      classification: this.intentClassification,
+      classification: {
+        complexity: "trivial",
+        confidence: 1,
+        suggestedActions: [],
+        reasoning: "Direct-to-LLM \u2014 no classification, system prompt guides behavior"
+      },
       goal: prompt
     });
-    this.debugHarness?.trace("classification", "intent-classified", {
-      complexity: this.intentClassification.complexity,
-      confidence: this.intentClassification.confidence,
-      suggestedActions: this.intentClassification.suggestedActions,
-      reasoning: this.intentClassification.reasoning,
-      todoWriteRequired: cfg.requireTodoWrite
-    });
-    if (canSkipTodoWrite(this.intentClassification)) {
-      log5.info("Skipping TodoWrite requirement due to task complexity", {
-        complexity: this.intentClassification.complexity
-      });
-      cfg.requireTodoWrite = false;
-      this.debugHarness?.trace("classification", "todowrite-skipped", {
-        complexity: this.intentClassification.complexity,
-        reason: "Trivial or simple query \u2014 no plan required"
-      });
-    }
-    if (needsClarification(this.intentClassification)) {
-      log5.info("Task needs clarification - injecting agent_ask_user enforcement");
-      this.history.push({
-        role: "user",
-        content: `[System Instruction] IMPORTANT: This request requires clarifying questions. You MUST use the agent_ask_user tool with structured questions and options. DO NOT ask questions in plain text. Call agent_ask_user now with 2-4 relevant questions before proceeding.`
-      });
-    }
     this.hasPlan = false;
     this.planEnforcementAttempts = 0;
     this.currentTodos = [];
@@ -1614,7 +1460,7 @@ var ConversationEngine = class {
    * Main conversation loop
    */
   async runLoop(config, startTime) {
-    log5.info("Starting conversation loop", { maxTurns: config.maxTurns, timeoutMs: config.timeoutMs, startTurn: this.currentTurn });
+    log4.info("Starting conversation loop", { maxTurns: config.maxTurns, timeoutMs: config.timeoutMs, startTurn: this.currentTurn });
     while (this.currentTurn < config.maxTurns) {
       if (this.abortController?.signal.aborted || config.signal?.aborted) {
         this.debugHarness?.trace("termination", "cancelled", {
@@ -1630,10 +1476,7 @@ var ConversationEngine = class {
         return this.createResult(false, "Conversation timeout", Date.now() - startTime, "failed");
       }
       this.currentTurn++;
-      this.history = this.history.filter(
-        (m) => !(m.role === "user" && (m.content.startsWith("[System Reminder]") || m.content.startsWith("[Active Tasks]")))
-      );
-      log5.info("Turn", { turn: this.currentTurn, historyLength: this.history.length });
+      log4.info("Turn", { turn: this.currentTurn, historyLength: this.history.length });
       this.debugHarness?.setTurn(this.currentTurn);
       this.debugHarness?.trace("turn-start", "turn-begin", {
         turn: this.currentTurn,
@@ -1643,47 +1486,25 @@ var ConversationEngine = class {
         activeTodos: this.currentTodos.filter((t) => t.status !== "completed").map((t) => t.content),
         hasProducedOutput: this.hasProducedOutput
       });
-      if (config.requireTodoWrite && !this.hasPlan && this.intentClassification) {
-        const guidance = getTodoWriteGuidance({
-          complexity: this.intentClassification.complexity,
-          turnNumber: this.currentTurn,
-          hasProducedOutput: this.hasProducedOutput
-        });
-        if (guidance.level !== "none" && guidance.message) {
-          this.decisionLogger.log({
-            turn: this.currentTurn,
-            decision: "todowrite-guidance",
-            reason: `Complexity: ${this.intentClassification.complexity}, Level: ${guidance.level}`,
-            inputs: {
-              complexity: this.intentClassification.complexity,
-              turnNumber: this.currentTurn,
-              hasProducedOutput: this.hasProducedOutput
-            },
-            outcome: guidance.level
-          });
-          this.history.push({
-            role: "user",
-            content: `[System Reminder] ${guidance.message}`
-          });
-          log5.info("TodoWrite guidance injected", {
-            level: guidance.level,
-            turn: this.currentTurn
-          });
-          this.debugHarness?.trace("turn-start", "todowrite-guidance-injected", {
-            level: guidance.level,
-            complexity: this.intentClassification.complexity,
-            message: guidance.message
-          });
+      if (this.baseSystemPrompt && this.history.length > 0 && this.history[0].role === "system") {
+        const stateParts = [];
+        if (this.currentTodos.length > 0) {
+          const activeTodos = this.currentTodos.filter((t) => t.status !== "completed").map((t) => `- [${t.status}] ${t.content}`).join("\n");
+          if (activeTodos) {
+            if (activeTodos === this.lastActiveTodosSnapshot) {
+              this.staleTodoTurns++;
+            } else {
+              this.staleTodoTurns = 0;
+              this.lastActiveTodosSnapshot = activeTodos;
+            }
+            stateParts.push(`Active Tasks:
+${activeTodos}`);
+          }
         }
-      }
-      if (this.currentTodos.length > 0) {
-        const activeTodos = this.currentTodos.filter((t) => t.status !== "completed").map((t) => `- [${t.status}] ${t.content}`).join("\n");
-        if (activeTodos) {
-          this.history.push({
-            role: "user",
-            content: `[Active Tasks]
-${activeTodos}`
-          });
+        if (stateParts.length > 0) {
+          this.history[0].content = this.baseSystemPrompt + "\n\n## Current State\n" + stateParts.join("\n\n");
+        } else {
+          this.history[0].content = this.baseSystemPrompt;
         }
       }
       let response;
@@ -1691,14 +1512,17 @@ ${activeTodos}`
         const remainingTime = config.timeoutMs - (Date.now() - startTime);
         if (remainingTime <= 0) {
           this.status = "failed";
-          log5.warn("Timeout before LLM call", { turn: this.currentTurn });
+          log4.warn("Timeout before LLM call", { turn: this.currentTurn });
           return this.createResult(false, "Conversation timeout", Date.now() - startTime, "failed");
         }
-        const toolsList = this.tools.list();
-        log5.debug("=".repeat(80));
-        log5.debug(`TURN ${this.currentTurn} - SENDING TO LLM`);
-        log5.debug("=".repeat(80));
-        log5.debug("Message History:", {
+        const toolsList = this.tools.list().filter((t) => ACTIVE_TOOLS.has(t.name));
+        if (this.taskSpawner) {
+          toolsList.push(...SUBAGENT_TOOL_DEFINITIONS);
+        }
+        log4.debug("=".repeat(80));
+        log4.debug(`TURN ${this.currentTurn} - SENDING TO LLM`);
+        log4.debug("=".repeat(80));
+        log4.debug("Message History:", {
           messageCount: this.history.length,
           messages: this.history.map((msg, idx) => ({
             index: idx,
@@ -1710,9 +1534,9 @@ ${activeTodos}`
             toolNames: msg.toolCalls?.map((tc) => tc.name)
           }))
         });
-        log5.debug("Available Tools:", { count: toolsList.length, tools: toolsList.map((t) => t.name) });
-        log5.debug("Full Prompt:", { history: this.history });
-        log5.debug("=".repeat(80));
+        log4.debug("Available Tools:", { count: toolsList.length, tools: toolsList.map((t) => t.name) });
+        log4.debug("Full Prompt:", { history: this.history });
+        log4.debug("=".repeat(80));
         let messagesToSend = this.history;
         if (config.compression) {
           this.contextCompressor.updateConfig(config.compression);
@@ -1723,7 +1547,7 @@ ${activeTodos}`
         );
         if (compressionResult.wasCompressed) {
           messagesToSend = compressionResult.messages;
-          log5.info("Context compressed before LLM call", {
+          log4.info("Context compressed before LLM call", {
             originalTokens: compressionResult.originalTokens,
             compressedTokens: compressionResult.compressedTokens,
             summarizedTurns: compressionResult.summarizedTurns
@@ -1743,6 +1567,17 @@ ${activeTodos}`
             toolCalls: m.toolCalls?.map((tc) => tc.name)
           }))
         });
+        await this.events.emit("conversation:llm-request", {
+          turn: this.currentTurn,
+          messages: messagesToSend.map((m) => ({
+            role: m.role,
+            contentPreview: m.content?.substring(0, 300) ?? "",
+            contentLength: m.content?.length ?? 0,
+            toolCalls: m.toolCalls?.map((tc) => tc.name)
+          })),
+          toolNames: toolsList.map((t) => t.name),
+          compressed: compressionResult.wasCompressed
+        });
         const llmPromise = this.llm.chat(messagesToSend, {
           tools: toolsList,
           maxTokens: config.maxTokensPerTurn,
@@ -1756,18 +1591,18 @@ ${activeTodos}`
           }, remainingTime);
         });
         response = await Promise.race([llmPromise, timeoutPromise]);
-        log5.debug("=".repeat(80));
-        log5.debug(`TURN ${this.currentTurn} - RECEIVED FROM LLM`);
-        log5.debug("=".repeat(80));
-        log5.debug("Response Summary:", {
+        log4.debug("=".repeat(80));
+        log4.debug(`TURN ${this.currentTurn} - RECEIVED FROM LLM`);
+        log4.debug("=".repeat(80));
+        log4.debug("Response Summary:", {
           contentLength: response.content?.length ?? 0,
           hasToolCalls: !!response.toolCalls,
           toolCallCount: response.toolCalls?.length ?? 0,
           finishReason: response.finishReason
         });
-        log5.debug("Content:", { content: response.content });
+        log4.debug("Content:", { content: response.content });
         if (response.toolCalls && response.toolCalls.length > 0) {
-          log5.debug("Tool Calls:", {
+          log4.debug("Tool Calls:", {
             toolCalls: response.toolCalls.map((tc) => ({
               id: tc.id,
               name: tc.name,
@@ -1775,8 +1610,8 @@ ${activeTodos}`
             }))
           });
         }
-        log5.debug("Full Response:", { response });
-        log5.debug("=".repeat(80));
+        log4.debug("Full Response:", { response });
+        log4.debug("=".repeat(80));
         this.debugHarness?.trace("llm-response", "received-from-llm", {
           turn: this.currentTurn,
           contentLength: response.content?.length ?? 0,
@@ -1786,8 +1621,15 @@ ${activeTodos}`
           toolCalls: response.toolCalls?.map((tc) => ({ name: tc.name, paramKeys: Object.keys(tc.params) })),
           usage: response.usage
         });
+        await this.events.emit("conversation:llm-response", {
+          turn: this.currentTurn,
+          content: response.content ?? "",
+          finishReason: response.finishReason ?? "unknown",
+          toolCalls: (response.toolCalls ?? []).map((tc) => ({ name: tc.name, params: tc.params })),
+          usage: response.usage
+        });
       } catch (error) {
-        log5.error("LLM call failed", { turn: this.currentTurn, error: error.message, name: error.name });
+        log4.error("LLM call failed", { turn: this.currentTurn, error: error.message, name: error.name });
         this.debugHarness?.trace("error", "llm-call-failed", {
           turn: this.currentTurn,
           errorName: error.name,
@@ -1816,20 +1658,20 @@ ${activeTodos}`
         );
         if (hasTodoWrite) {
           this.hasPlan = true;
-          log5.info("TodoWrite called - plan established", { turn: this.currentTurn });
+          log4.info("TodoWrite called - plan established", { turn: this.currentTurn });
           this.debugHarness?.trace("todowrite-gate", "plan-established", {
             turn: this.currentTurn
           });
         } else if (response.toolCalls && response.toolCalls.length > 0) {
           const exemptTools = filterExemptTools(response.toolCalls);
           const actionTools = filterActionTools(response.toolCalls);
-          log5.debug("Tool exemption check", {
+          log4.debug("Tool exemption check", {
             turn: this.currentTurn,
             exemptTools: exemptTools.map((tc) => tc.name),
             actionTools: actionTools.map((tc) => tc.name)
           });
           if (actionTools.length === 0 && exemptTools.length > 0) {
-            log5.info("Allowing exempt tools without TodoWrite", {
+            log4.info("Allowing exempt tools without TodoWrite", {
               turn: this.currentTurn,
               tools: exemptTools.map((tc) => tc.name)
             });
@@ -1840,7 +1682,7 @@ ${activeTodos}`
             });
           } else if (actionTools.length > 0) {
             this.planEnforcementAttempts++;
-            log5.warn("Agent using action tools without TodoWrite plan", {
+            log4.warn("Agent using action tools without TodoWrite plan", {
               turn: this.currentTurn,
               attempt: this.planEnforcementAttempts,
               maxAttempts: this.MAX_PLAN_ENFORCEMENT_ATTEMPTS,
@@ -1883,10 +1725,18 @@ ${activeTodos}`
         }
       }
       if (!this.hasPlan && this.currentTurn > this.MAX_PLAN_ENFORCEMENT_ATTEMPTS) {
-        log5.warn("Agent proceeding without TodoWrite plan after max enforcement attempts");
+        log4.warn("Agent proceeding without TodoWrite plan after max enforcement attempts");
       }
       if (!response.toolCalls || response.toolCalls.length === 0) {
-        log5.info("Conversation complete", { turn: this.currentTurn, finishReason: response.finishReason });
+        if (response.finishReason === "tool_calls") {
+          log4.warn("All tool calls were filtered out \u2014 continuing loop", { turn: this.currentTurn });
+          this.debugHarness?.trace("turn-end", "tools-filtered-retry", {
+            turn: this.currentTurn,
+            finishReason: response.finishReason
+          });
+          continue;
+        }
+        log4.info("Conversation complete", { turn: this.currentTurn, finishReason: response.finishReason });
         this.debugHarness?.trace("completion", "conversation-done", {
           turn: this.currentTurn,
           finishReason: response.finishReason,
@@ -1903,62 +1753,159 @@ ${activeTodos}`
         });
         return this.createResult(true, void 0, Date.now() - startTime);
       }
-      for (const toolCall of response.toolCalls) {
-        await this.events.emit("conversation:tool-call", { toolCall });
-        log5.debug("-".repeat(80));
-        log5.debug(`EXECUTING TOOL: ${toolCall.name}`);
-        log5.debug("Tool Parameters:", { params: toolCall.params });
-        const result = await this.executeTool(toolCall);
-        log5.debug("Tool Result:", {
-          success: result.success,
-          hasData: !!result.data,
-          hasError: !!result.error,
-          observation: result.observation,
-          fullResult: result
-        });
-        log5.debug("-".repeat(80));
-        this.debugHarness?.trace("tool-exec", `tool:${toolCall.name}`, {
+      const resultMap = /* @__PURE__ */ new Map();
+      const toolTimings = [];
+      if (config.parallelTools && response.toolCalls.length > 1) {
+        const { parallel, sequential } = partitionToolCalls(response.toolCalls);
+        const partitionStartMs = Date.now();
+        log4.info("Tool execution partitioned", {
           turn: this.currentTurn,
-          toolName: toolCall.name,
-          params: toolCall.params,
-          success: result.success,
-          error: result.error,
-          observationPreview: result.observation?.substring(0, 300),
-          hasStructured: !!result.structured,
-          structuredType: result.structured?.type,
-          structuredSummary: result.structured?.summary
+          total: response.toolCalls.length,
+          parallelCount: parallel.length,
+          sequentialCount: sequential.length,
+          parallelTools: parallel.map((tc) => tc.name),
+          sequentialTools: sequential.map((tc) => tc.name)
         });
-        await this.events.emit("conversation:tool-result", { toolCall, result });
-        this.toolResults.push({
-          toolName: toolCall.name,
-          success: result.success,
-          output: result.observation,
-          error: result.error
-        });
-        const toolMeta = getToolMetadata(toolCall.name);
-        if (toolMeta.category === "mutation" && result.success && result.data) {
-          const data = result.data;
-          if (data.path) this.outputPaths.push(String(data.path));
-          if (data.notePath) this.outputPaths.push(String(data.notePath));
-          if (data.filePath) this.outputPaths.push(String(data.filePath));
-        }
-        if (toolMeta.category === "mutation" && result.success) {
-          this.hasProducedOutput = true;
-        }
-        this.decisionLogger.log({
+        this.debugHarness?.trace("tool-exec", "parallel-start", {
           turn: this.currentTurn,
-          decision: "tool-executed",
-          reason: `Executed ${toolCall.name}`,
-          inputs: { toolName: toolCall.name, params: toolCall.params },
-          outcome: result.success ? "success" : "failure"
+          count: parallel.length,
+          tools: parallel.map((tc) => tc.name)
         });
-        const toolResultContent = this.formatToolResult(result);
+        if (parallel.length > 0) {
+          for (const tc of parallel) {
+            await this.events.emit("conversation:tool-call", { toolCall: tc });
+          }
+          const batchStartMs = Date.now();
+          const settled = await Promise.allSettled(
+            parallel.map(async (tc) => {
+              const startMs = Date.now();
+              log4.debug(`EXECUTING TOOL (parallel): ${tc.name}`, { params: tc.params });
+              const result = await this.executeTool(tc);
+              const endMs = Date.now();
+              toolTimings.push({ tool: tc.name, mode: "parallel", startMs, endMs, durationMs: endMs - startMs, success: result.success });
+              return { toolCall: tc, result };
+            })
+          );
+          const batchEndMs = Date.now();
+          log4.info("Parallel batch completed", {
+            turn: this.currentTurn,
+            wallClockMs: batchEndMs - batchStartMs,
+            tools: parallel.map((tc) => tc.name),
+            timings: toolTimings.filter((t) => t.mode === "parallel").map((t) => ({
+              tool: t.tool,
+              durationMs: t.durationMs,
+              success: t.success
+            }))
+          });
+          for (const outcome of settled) {
+            if (outcome.status === "fulfilled") {
+              const { toolCall, result } = outcome.value;
+              resultMap.set(toolCall.id, { toolCall, result });
+              await this.processToolResult(toolCall, result);
+            } else {
+              log4.error("Unexpected parallel tool rejection", { reason: outcome.reason });
+            }
+          }
+        }
+        for (const tc of sequential) {
+          await this.events.emit("conversation:tool-call", { toolCall: tc });
+          const startMs = Date.now();
+          log4.debug(`EXECUTING TOOL (sequential): ${tc.name}`, { params: tc.params });
+          const result = await this.executeTool(tc);
+          const endMs = Date.now();
+          toolTimings.push({ tool: tc.name, mode: "sequential", startMs, endMs, durationMs: endMs - startMs, success: result.success });
+          resultMap.set(tc.id, { toolCall: tc, result });
+          await this.processToolResult(tc, result);
+        }
+        const totalMs = Date.now() - partitionStartMs;
+        const sequentialSum = toolTimings.reduce((acc, t) => acc + t.durationMs, 0);
+        log4.info("Turn tool execution summary", {
+          turn: this.currentTurn,
+          wallClockMs: totalMs,
+          sumOfIndividualMs: sequentialSum,
+          savedMs: sequentialSum - totalMs,
+          timings: toolTimings.map((t) => ({
+            tool: t.tool,
+            mode: t.mode,
+            durationMs: t.durationMs,
+            success: t.success
+          }))
+        });
+        this.debugHarness?.trace("tool-exec", "parallel-end", {
+          turn: this.currentTurn,
+          count: parallel.length,
+          successes: [...resultMap.values()].filter((r) => r.result.success).length,
+          wallClockMs: totalMs,
+          savedMs: sequentialSum - totalMs,
+          timings: toolTimings
+        });
+      } else {
+        for (const tc of response.toolCalls) {
+          await this.events.emit("conversation:tool-call", { toolCall: tc });
+          const startMs = Date.now();
+          log4.debug(`EXECUTING TOOL: ${tc.name}`, { params: tc.params });
+          const result = await this.executeTool(tc);
+          const endMs = Date.now();
+          const durationMs = endMs - startMs;
+          log4.info(`Tool executed (single)`, { turn: this.currentTurn, tool: tc.name, durationMs, success: result.success });
+          resultMap.set(tc.id, { toolCall: tc, result });
+          await this.processToolResult(tc, result);
+        }
+      }
+      for (const tc of response.toolCalls) {
+        const entry = resultMap.get(tc.id);
+        if (entry) {
+          this.history.push({
+            role: "tool",
+            content: this.formatToolResult(entry.result),
+            toolCallId: tc.id,
+            toolName: tc.name
+          });
+        } else {
+          this.history.push({
+            role: "tool",
+            content: "Error: Tool execution failed unexpectedly",
+            toolCallId: tc.id,
+            toolName: tc.name
+          });
+        }
+      }
+      const loopAction = this.detectLoop(response.toolCalls ?? []);
+      if (loopAction === "force-stop") {
+        log4.warn("Loop detected \u2014 force-stopping conversation", {
+          turn: this.currentTurn,
+          staleTodoTurns: this.staleTodoTurns,
+          recentSignatures: this.recentToolSignatures
+        });
+        this.debugHarness?.trace("termination", "loop-detected-force-stop", {
+          turn: this.currentTurn,
+          staleTodoTurns: this.staleTodoTurns,
+          recentSignatures: this.recentToolSignatures
+        });
+        this.status = "completed";
+        return this.createResult(
+          true,
+          "Conversation stopped: repeated actions detected without progress. Returning results gathered so far.",
+          Date.now() - startTime,
+          "completed"
+        );
+      }
+      if (loopAction === "nudge") {
+        log4.info("Loop detected \u2014 injecting nudge", {
+          turn: this.currentTurn,
+          staleTodoTurns: this.staleTodoTurns
+        });
+        this.debugHarness?.trace("loop-detection", "nudge-injected", {
+          turn: this.currentTurn,
+          staleTodoTurns: this.staleTodoTurns,
+          recentSignatures: this.recentToolSignatures
+        });
         this.history.push({
-          role: "tool",
-          content: toolResultContent,
-          toolCallId: toolCall.id,
-          toolName: toolCall.name
-          // Required by AI SDK v6
+          role: "user",
+          content: `[System Reminder] You appear to be repeating the same actions without making progress. Your active tasks have not changed in ${this.staleTodoTurns} turns. Either:
+1. Mark your current tasks as completed with TodoWrite and present results to the user
+2. Change your approach \u2014 try different tools or queries
+3. If you have enough information, stop calling tools and respond with your findings`
         });
       }
       this.debugHarness?.trace("turn-end", "turn-complete", {
@@ -1980,12 +1927,59 @@ ${activeTodos}`
       durationMs: Date.now() - startTime
     });
     this.status = "timeout";
-    log5.warn("Max turns reached", { maxTurns: config.maxTurns, actualTurns: this.currentTurn });
+    log4.warn("Max turns reached", { maxTurns: config.maxTurns, actualTurns: this.currentTurn });
     await this.events.emit(
       "conversation:timeout",
       { conversationId: this.conversationId }
     );
     return this.createResult(false, "Reached max turns limit", Date.now() - startTime, "timeout");
+  }
+  // ===========================================================================
+  // LOOP DETECTION
+  // ===========================================================================
+  /**
+   * Detect if the conversation is looping — repeating the same tool calls
+   * or making no progress on active todos.
+   *
+   * Returns:
+   * - 'none'       — no loop detected, continue normally
+   * - 'nudge'      — stale todos detected, inject a reminder to change approach
+   * - 'force-stop' — severe loop detected, stop the conversation
+   */
+  detectLoop(toolCalls) {
+    const turnSignature = toolCalls.map((tc) => `${tc.name}:${JSON.stringify(tc.params)}`).sort().join("|");
+    this.recentToolSignatures.push(turnSignature);
+    if (this.recentToolSignatures.length > _ConversationEngine.LOOP_DETECTION_WINDOW) {
+      this.recentToolSignatures.shift();
+    }
+    if (this.recentToolSignatures.length >= _ConversationEngine.LOOP_DETECTION_WINDOW) {
+      const allSame = this.recentToolSignatures.every((s) => s === this.recentToolSignatures[0]);
+      if (allSame) {
+        log4.warn("Exact tool repetition detected", {
+          window: _ConversationEngine.LOOP_DETECTION_WINDOW,
+          signature: this.recentToolSignatures[0]?.substring(0, 200)
+        });
+        return "force-stop";
+      }
+    }
+    if (this.recentToolSignatures.length >= _ConversationEngine.LOOP_DETECTION_WINDOW) {
+      const toolNames = this.recentToolSignatures.map((s) => s.split(":")[0]);
+      const allSameToolName = toolNames.every((n) => n === toolNames[0]);
+      if (allSameToolName && this.staleTodoTurns >= _ConversationEngine.STALE_TODO_THRESHOLD) {
+        log4.warn("Same tool type with stale todos", {
+          toolName: toolNames[0],
+          staleTurns: this.staleTodoTurns
+        });
+        return "force-stop";
+      }
+    }
+    if (this.staleTodoTurns >= _ConversationEngine.STALE_TODO_FORCE_STOP) {
+      return "force-stop";
+    }
+    if (this.staleTodoTurns >= _ConversationEngine.STALE_TODO_THRESHOLD) {
+      return "nudge";
+    }
+    return "none";
   }
   // ===========================================================================
   // TOOL EXECUTION
@@ -1994,7 +1988,7 @@ ${activeTodos}`
    * Execute a single tool call
    */
   async executeTool(toolCall) {
-    log5.info("Tool", { name: toolCall.name });
+    log4.info("Tool", { name: toolCall.name });
     if (toolCall.name === "AskUserQuestion") {
       this.debugHarness?.trace("tool-special", "ask-user-question", {
         turn: this.currentTurn,
@@ -2016,6 +2010,21 @@ ${activeTodos}`
         callCount: Array.isArray(toolCall.params.calls) ? toolCall.params.calls.length : 0
       });
       return this.handleBatchTools(toolCall.params);
+    }
+    if (toolCall.name === "spawn_task" && this.taskSpawner) {
+      this.debugHarness?.trace("tool-special", "spawn-task", {
+        turn: this.currentTurn,
+        subagentType: toolCall.params.subagentType,
+        runInBackground: toolCall.params.runInBackground
+      });
+      return this.handleSpawnTask(toolCall.params);
+    }
+    if (toolCall.name === "task_status" && this.taskSpawner) {
+      this.debugHarness?.trace("tool-special", "task-status", {
+        turn: this.currentTurn,
+        taskId: toolCall.params.taskId
+      });
+      return this.handleTaskStatus(toolCall.params);
     }
     if (!this.tools.has(toolCall.name)) {
       this.debugHarness?.trace("error", "tool-not-found", {
@@ -2044,7 +2053,7 @@ ${activeTodos}`
       {
         signal: this.abortController?.signal,
         onRetry: (attempt, error, delayMs) => {
-          log5.info(`Retrying tool ${toolCall.name}`, {
+          log4.info(`Retrying tool ${toolCall.name}`, {
             attempt,
             error: error.message,
             delayMs
@@ -2089,14 +2098,6 @@ ${activeTodos}`
    */
   async handleTodoWrite(params) {
     const todos = params.todos;
-    const inProgress = todos.filter((t) => t.status === "in_progress");
-    if (inProgress.length > 1) {
-      return {
-        success: false,
-        error: "Only one task can be in_progress at a time",
-        observation: "Error: Only one task can be in_progress at a time"
-      };
-    }
     this.currentTodos = todos;
     await this.events.emit("todo:updated", { todos });
     for (const todo of todos) {
@@ -2118,7 +2119,16 @@ ${activeTodos}`
    * to still execute multiple tools per turn.
    */
   async handleBatchTools(params) {
-    const calls = params.calls;
+    let calls = params.calls;
+    if (typeof calls === "string") {
+      try {
+        const parsed = JSON.parse(calls);
+        if (Array.isArray(parsed)) {
+          calls = parsed;
+        }
+      } catch {
+      }
+    }
     if (!calls || !Array.isArray(calls)) {
       return {
         success: false,
@@ -2133,36 +2143,92 @@ ${activeTodos}`
         observation: 'Error: batch_tools "calls" array is empty. Provide at least one tool call.'
       };
     }
-    log5.info("Executing batch_tools", { callCount: calls.length, tools: calls.map((c) => c.tool) });
-    const results = [];
-    for (const call of calls) {
-      const subToolCall = {
-        id: `batch_${call.tool}_${Date.now()}`,
-        name: call.tool,
-        params: call.params || {}
-      };
-      log5.debug("Batch: executing sub-tool", { tool: call.tool });
-      const result = await this.executeTool(subToolCall);
-      results.push({ tool: call.tool, result });
-      await this.events.emit("conversation:tool-call", { toolCall: subToolCall });
-      await this.events.emit("conversation:tool-result", { toolCall: subToolCall, result });
-      this.toolResults.push({
-        toolName: call.tool,
-        success: result.success,
-        output: result.observation,
-        error: result.error
+    log4.info("Executing batch_tools", { callCount: calls.length, tools: calls.map((c) => c.tool) });
+    const subToolCalls = calls.map((call, i) => ({
+      id: `batch_${call.tool}_${i}_${Date.now()}`,
+      name: call.tool,
+      params: call.params || {}
+    }));
+    const { parallel, sequential } = partitionToolCalls(subToolCalls);
+    const batchResultMap = /* @__PURE__ */ new Map();
+    const batchTimings = [];
+    this.debugHarness?.trace("tool-exec", "batch-partitioned", {
+      turn: this.currentTurn,
+      parallelCount: parallel.length,
+      sequentialCount: sequential.length,
+      parallelTools: parallel.map((tc) => tc.name),
+      sequentialTools: sequential.map((tc) => tc.name)
+    });
+    if (parallel.length > 1) {
+      this.debugHarness?.trace("tool-exec", "batch-parallel-start", {
+        turn: this.currentTurn,
+        count: parallel.length,
+        tools: parallel.map((tc) => tc.name)
       });
-      const toolMeta = getToolMetadata(call.tool);
-      if (toolMeta.category === "mutation" && result.success && result.data) {
-        const data = result.data;
-        if (data.path) this.outputPaths.push(String(data.path));
-        if (data.notePath) this.outputPaths.push(String(data.notePath));
-        if (data.filePath) this.outputPaths.push(String(data.filePath));
+      for (const tc of parallel) {
+        await this.events.emit("conversation:tool-call", { toolCall: tc });
       }
-      if (toolMeta.category === "mutation" && result.success) {
-        this.hasProducedOutput = true;
+      const batchStartMs = Date.now();
+      const settled = await Promise.allSettled(
+        parallel.map(async (subToolCall) => {
+          const startMs = Date.now();
+          const result = await this.executeTool(subToolCall);
+          batchTimings.push({ tool: subToolCall.name, mode: "parallel", durationMs: Date.now() - startMs, success: result.success });
+          return { subToolCall, result };
+        })
+      );
+      const batchWallMs = Date.now() - batchStartMs;
+      this.debugHarness?.trace("tool-exec", "batch-parallel-end", {
+        turn: this.currentTurn,
+        wallClockMs: batchWallMs,
+        timings: batchTimings.filter((t) => t.mode === "parallel")
+      });
+      for (const outcome of settled) {
+        if (outcome.status === "fulfilled") {
+          const { subToolCall, result } = outcome.value;
+          batchResultMap.set(subToolCall.id, { tool: subToolCall.name, result });
+          await this.processToolResult(subToolCall, result);
+        } else {
+          log4.error("Unexpected batch parallel tool rejection", { reason: outcome.reason });
+        }
+      }
+    } else {
+      for (const tc of parallel) {
+        await this.events.emit("conversation:tool-call", { toolCall: tc });
+        const startMs = Date.now();
+        const result = await this.executeTool(tc);
+        batchTimings.push({ tool: tc.name, mode: "sequential", durationMs: Date.now() - startMs, success: result.success });
+        batchResultMap.set(tc.id, { tool: tc.name, result });
+        await this.processToolResult(tc, result);
       }
     }
+    for (const tc of sequential) {
+      await this.events.emit("conversation:tool-call", { toolCall: tc });
+      const startMs = Date.now();
+      const result = await this.executeTool(tc);
+      batchTimings.push({ tool: tc.name, mode: "sequential", durationMs: Date.now() - startMs, success: result.success });
+      batchResultMap.set(tc.id, { tool: tc.name, result });
+      await this.processToolResult(tc, result);
+    }
+    const results = [];
+    for (const tc of subToolCalls) {
+      const entry = batchResultMap.get(tc.id);
+      if (entry) {
+        results.push(entry);
+      }
+    }
+    batchTimings.reduce((a, t) => a + t.durationMs, 0);
+    const parallelTimings = batchTimings.filter((t) => t.mode === "parallel");
+    const maxParallelMs = parallelTimings.length > 0 ? Math.max(...parallelTimings.map((t) => t.durationMs)) : 0;
+    const parallelSumMs = parallelTimings.reduce((a, t) => a + t.durationMs, 0);
+    this.debugHarness?.trace("tool-exec", "batch-summary", {
+      turn: this.currentTurn,
+      toolCount: results.length,
+      parallelCount: parallelTimings.length,
+      wallClockMs: maxParallelMs + batchTimings.filter((t) => t.mode === "sequential").reduce((a, t) => a + t.durationMs, 0),
+      savedMs: parallelSumMs > 0 ? parallelSumMs - maxParallelMs : 0,
+      timings: batchTimings
+    });
     const combinedParts = [`[BATCH] Executed ${results.length} tool(s):`];
     for (const { tool: tool2, result } of results) {
       const formatted = this.formatToolResult(result);
@@ -2175,6 +2241,164 @@ ${activeTodos}`
       data: { batchResults: results.map((r) => ({ tool: r.tool, success: r.result.success, data: r.result.data })) },
       observation: combinedParts.join("\n")
     };
+  }
+  // ===========================================================================
+  // SUB-AGENT TOOLS
+  // ===========================================================================
+  /**
+   * Handle spawn_task tool call — delegates to TaskSpawner
+   */
+  async handleSpawnTask(params) {
+    if (!this.taskSpawner) {
+      return {
+        success: false,
+        error: "Sub-agents not available",
+        observation: "Error: spawn_task is not configured. No TaskSpawner available."
+      };
+    }
+    const taskParams = {
+      description: String(params.description || ""),
+      prompt: String(params.prompt || ""),
+      subagentType: params.subagentType || "general-purpose",
+      model: params.model,
+      runInBackground: Boolean(params.runInBackground)
+    };
+    try {
+      log4.info("Spawning sub-agent", {
+        type: taskParams.subagentType,
+        model: taskParams.model,
+        background: taskParams.runInBackground,
+        description: taskParams.description
+      });
+      const result = await this.taskSpawner.spawn(taskParams);
+      if (result.status === "running") {
+        return {
+          success: true,
+          data: { taskId: result.taskId },
+          observation: `Sub-agent spawned in background (taskId: ${result.taskId}). Use task_status to check results.`
+        };
+      }
+      return {
+        success: result.success,
+        data: result.data,
+        observation: result.success ? `Sub-agent completed successfully:
+${typeof result.data === "string" ? result.data : JSON.stringify(result.data, null, 2)}` : `Sub-agent failed: ${result.error || "Unknown error"}`
+      };
+    } catch (e) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      log4.error("spawn_task failed", { error: errorMsg });
+      return {
+        success: false,
+        error: errorMsg,
+        observation: `spawn_task failed: ${errorMsg}`
+      };
+    }
+  }
+  /**
+   * Handle task_status tool call — checks status of background sub-agent tasks
+   */
+  async handleTaskStatus(params) {
+    if (!this.taskSpawner) {
+      return {
+        success: false,
+        error: "Sub-agents not available",
+        observation: "Error: task_status is not configured. No TaskSpawner available."
+      };
+    }
+    const taskId = String(params.taskId || "");
+    if (!taskId) {
+      return {
+        success: false,
+        error: "taskId is required",
+        observation: "Error: taskId parameter is required for task_status."
+      };
+    }
+    const shouldWait = Boolean(params.wait);
+    try {
+      if (this.taskSpawner.isRunning(taskId)) {
+        if (shouldWait) {
+          const result2 = await this.taskSpawner.getResult(taskId);
+          if (result2) {
+            return {
+              success: result2.success,
+              data: result2.data,
+              observation: result2.success ? `Task ${taskId} completed:
+${typeof result2.data === "string" ? result2.data : JSON.stringify(result2.data, null, 2)}` : `Task ${taskId} failed: ${result2.error}`
+            };
+          }
+        }
+        return {
+          success: true,
+          data: { taskId, status: "running" },
+          observation: `Task ${taskId} is still running.`
+        };
+      }
+      const result = await this.taskSpawner.getResult(taskId);
+      if (result) {
+        return {
+          success: result.success,
+          data: result.data,
+          observation: result.success ? `Task ${taskId} completed:
+${typeof result.data === "string" ? result.data : JSON.stringify(result.data, null, 2)}` : `Task ${taskId} failed: ${result.error}`
+        };
+      }
+      return {
+        success: false,
+        error: `Task ${taskId} not found`,
+        observation: `Error: No task found with ID ${taskId}.`
+      };
+    } catch (e) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      return {
+        success: false,
+        error: errorMsg,
+        observation: `task_status failed: ${errorMsg}`
+      };
+    }
+  }
+  // ===========================================================================
+  // TOOL RESULT PROCESSING
+  // ===========================================================================
+  /**
+   * Process a tool result: trace, emit events, track metadata.
+   * Extracted from the main loop and handleBatchTools to avoid duplication.
+   */
+  async processToolResult(toolCall, result) {
+    this.debugHarness?.trace("tool-exec", `tool:${toolCall.name}`, {
+      turn: this.currentTurn,
+      toolName: toolCall.name,
+      params: toolCall.params,
+      success: result.success,
+      error: result.error,
+      observationPreview: result.observation?.substring(0, 300),
+      hasStructured: !!result.structured,
+      structuredType: result.structured?.type,
+      structuredSummary: result.structured?.summary
+    });
+    await this.events.emit("conversation:tool-result", { toolCall, result });
+    this.toolResults.push({
+      toolName: toolCall.name,
+      success: result.success,
+      output: result.observation,
+      error: result.error
+    });
+    const toolMeta = getToolMetadata(toolCall.name);
+    if (toolMeta.category === "mutation" && result.success && result.data) {
+      const data = result.data;
+      if (data.path) this.outputPaths.push(String(data.path));
+      if (data.notePath) this.outputPaths.push(String(data.notePath));
+      if (data.filePath) this.outputPaths.push(String(data.filePath));
+    }
+    if (toolMeta.category === "mutation" && result.success) {
+      this.hasProducedOutput = true;
+    }
+    this.decisionLogger.log({
+      turn: this.currentTurn,
+      decision: "tool-executed",
+      reason: `Executed ${toolCall.name}`,
+      inputs: { toolName: toolCall.name, params: toolCall.params },
+      outcome: result.success ? "success" : "failure"
+    });
   }
   // ===========================================================================
   // HELPERS
@@ -2199,8 +2423,18 @@ ${activeTodos}`
       const parts = [];
       parts.push(`[${s.type.toUpperCase()}] ${s.summary}`);
       if (s.fields) {
-        const fieldEntries = Object.entries(s.fields).filter(([_key, value]) => {
-          if (Array.isArray(value) && value.length > 5) return false;
+        const scalarFields = [];
+        const objectArrayFields = [];
+        for (const [key, value] of Object.entries(s.fields)) {
+          if (Array.isArray(value) && value.length > 0 && typeof value[0] === "object" && value[0] !== null) {
+            objectArrayFields.push([key, value]);
+          } else if (Array.isArray(value) && value.length > 10) {
+            objectArrayFields.push([key, value]);
+          } else {
+            scalarFields.push([key, value]);
+          }
+        }
+        const fieldEntries = scalarFields.filter(([_key, value]) => {
           if (typeof value === "object" && value !== null) {
             const str = JSON.stringify(value);
             if (str.length > 200) return false;
@@ -2211,18 +2445,17 @@ ${activeTodos}`
           parts.push("Fields:");
           parts.push(...fieldEntries);
         }
-        const resultArrays = Object.entries(s.fields).filter(
-          ([_, value]) => Array.isArray(value) && value.length > 5
-        );
-        for (const [key, value] of resultArrays) {
-          const arr = value;
+        for (const [key, arr] of objectArrayFields) {
           parts.push(`
 ${key} (${arr.length} items):`);
           arr.slice(0, 10).forEach((item, i) => {
             if (typeof item === "object" && item !== null) {
               const obj = item;
-              const summary = obj.title || obj.name || obj.id || JSON.stringify(item).slice(0, 80);
-              parts.push(`  ${i + 1}. ${summary}`);
+              const idPart = obj.id ? `[id: "${obj.id}"] ` : "";
+              const label = obj.title || obj.name || (!obj.id ? JSON.stringify(item).slice(0, 80) : "");
+              const scorePart = obj.score !== void 0 ? ` (score: ${Number(obj.score).toFixed(2)})` : "";
+              const simPart = obj.similarity !== void 0 ? ` (sim: ${Number(obj.similarity).toFixed(2)})` : "";
+              parts.push(`  ${i + 1}. ${idPart}${label}${scorePart}${simPart}`);
             } else {
               parts.push(`  ${i + 1}. ${item}`);
             }
@@ -2305,7 +2538,7 @@ ${key} (${arr.length} items):`);
    */
   async checkpoint() {
     if (!this.conversationId) {
-      log5.warn("Cannot checkpoint: no active conversation");
+      log4.warn("Cannot checkpoint: no active conversation");
       return;
     }
     const snapshot = this.store.createSnapshot(
@@ -2323,7 +2556,7 @@ ${key} (${arr.length} items):`);
       }
     );
     await this.store.save(snapshot);
-    log5.debug("Checkpoint saved", { id: this.conversationId, turn: this.currentTurn });
+    log4.debug("Checkpoint saved", { id: this.conversationId, turn: this.currentTurn });
     await this.events.emit("conversation:checkpoint", {
       conversationId: this.conversationId,
       turn: this.currentTurn
@@ -2337,14 +2570,14 @@ ${key} (${arr.length} items):`);
    * @returns ConversationResult from continued execution
    */
   async resume(conversationId, config) {
-    log5.info("Resuming conversation", { id: conversationId });
+    log4.info("Resuming conversation", { id: conversationId });
     const snapshot = await this.store.load(conversationId);
     if (!snapshot) {
-      log5.error("Cannot resume: conversation not found", { id: conversationId });
+      log4.error("Cannot resume: conversation not found", { id: conversationId });
       return this.createResult(false, `Conversation ${conversationId} not found`, 0, "failed");
     }
     if (this.isRunning()) {
-      log5.warn("Cannot resume: conversation already running");
+      log4.warn("Cannot resume: conversation already running");
       return this.createResult(false, "Conversation already running", 0);
     }
     this.conversationId = snapshot.id;
@@ -2373,6 +2606,7 @@ ${key} (${arr.length} items):`);
         timeoutMs: config?.timeoutMs ?? 3e5,
         maxTokensPerTurn: config?.maxTokensPerTurn ?? 4096,
         requireTodoWrite: config?.requireTodoWrite ?? true,
+        parallelTools: config?.parallelTools ?? true,
         systemPrompt: config?.systemPrompt,
         signal: config?.signal
       };
@@ -2410,7 +2644,7 @@ ${key} (${arr.length} items):`);
    */
   setAutoCheckpoint(enabled) {
     this.autoCheckpoint = enabled;
-    log5.debug("Auto-checkpoint", { enabled });
+    log4.debug("Auto-checkpoint", { enabled });
   }
   /**
    * Set a custom conversation store
@@ -2421,7 +2655,7 @@ ${key} (${arr.length} items):`);
 };
 
 // src/kernel/TodoManager.ts
-var log6 = createLogger("TodoManager");
+var log5 = createLogger("TodoManager");
 var VALID_STATUSES = ["pending", "in_progress", "completed"];
 function validateTodo(todo) {
   if (!todo.content || todo.content.trim() === "") {
@@ -2442,42 +2676,42 @@ var TodoManager = class {
   isProcessingEvent = false;
   constructor(events) {
     this.events = events;
-    log6.info("TodoManager constructor - subscribing to todo:updated events");
+    log5.info("TodoManager constructor - subscribing to todo:updated events");
     this.events.on("todo:updated", (payload) => {
-      log6.info("TodoManager received todo:updated event", {
+      log5.info("TodoManager received todo:updated event", {
         isProcessingEvent: this.isProcessingEvent,
         payload
       });
       if (this.isProcessingEvent) {
-        log6.debug("Ignoring event - self-emitted");
+        log5.debug("Ignoring event - self-emitted");
         return;
       }
       const todos = payload.todos;
       this.handleExternalUpdate(todos);
     });
-    log6.info("TodoManager constructor complete - subscription active");
+    log5.info("TodoManager constructor complete - subscription active");
   }
   /**
    * Handle external todo updates (from ConversationEngine)
    * Updates internal state and notifies subscribers without re-emitting events
    */
   handleExternalUpdate(todos) {
-    log6.info("handleExternalUpdate called", { todoCount: todos.length, todos });
+    log5.info("handleExternalUpdate called", { todoCount: todos.length, todos });
     for (const todo of todos) {
       const error = validateTodo(todo);
       if (error) {
-        log6.warn("Invalid todo from external update", { error, todo });
+        log5.warn("Invalid todo from external update", { error, todo });
         return;
       }
     }
     const inProgress = todos.filter((t) => t.status === "in_progress");
     if (inProgress.length > 1) {
-      log6.warn("External update has multiple in_progress tasks");
+      log5.warn("External update has multiple in_progress tasks");
       return;
     }
     this.todos = todos.map((t) => ({ ...t }));
-    log6.info("Internal todos updated", { todoCount: this.todos.length });
-    log6.info("Notifying subscribers", { subscriberCount: this.subscribers.size });
+    log5.info("Internal todos updated", { todoCount: this.todos.length });
+    log5.info("Notifying subscribers", { subscriberCount: this.subscribers.size });
     this.notifySubscribers();
   }
   // ===========================================================================
@@ -2504,13 +2738,6 @@ var TodoManager = class {
       if (error) {
         return { success: false, error };
       }
-    }
-    const inProgress = todos.filter((t) => t.status === "in_progress");
-    if (inProgress.length > 1) {
-      return {
-        success: false,
-        error: "Only one task can be in_progress at a time"
-      };
     }
     const previousTodos = this.todos;
     this.todos = todos.map((t) => ({ ...t }));
@@ -2637,10 +2864,10 @@ var TodoManager = class {
    */
   subscribe(callback) {
     this.subscribers.add(callback);
-    log6.info("Subscriber added to TodoManager", { subscriberCount: this.subscribers.size });
+    log5.info("Subscriber added to TodoManager", { subscriberCount: this.subscribers.size });
     return () => {
       this.subscribers.delete(callback);
-      log6.info("Subscriber removed from TodoManager", { subscriberCount: this.subscribers.size });
+      log5.info("Subscriber removed from TodoManager", { subscriberCount: this.subscribers.size });
     };
   }
   // ===========================================================================
@@ -2677,8 +2904,47 @@ var AGENT_TYPE_CONFIGS = {
   // New lowercase agent types
   explore: {
     defaultModel: "haiku",
-    allowedTools: ["Read", "Glob", "Grep", "LS"],
-    systemPromptSuffix: "You are a fast exploration agent. Only use read-only tools."
+    allowedTools: [
+      // Filesystem
+      "Read",
+      "Glob",
+      "Grep",
+      "LS",
+      // Vault search & read (read-only)
+      "search_fulltext",
+      "search_vector",
+      "search_hybrid",
+      "vault_read_note",
+      // Graph exploration (read-only)
+      "graph_expand_neighbors",
+      "graph_centrality",
+      "graph_backlinks",
+      "graph_outlinks",
+      "graph_shortest_path",
+      // LLM analysis (read-only)
+      "llm_extract",
+      "llm_summarize",
+      "llm_classify",
+      "llm_analyze",
+      // Memory (read-only)
+      "memory_recall",
+      "memory_search",
+      // Utils
+      "utils_merge_dedupe",
+      "utils_filter",
+      "utils_sort",
+      "utils_format"
+    ],
+    systemPromptSuffix: `You are a fast exploration sub-agent. Your job is to search, read, and analyze notes \u2014 then return your findings to the parent agent.
+
+RULES:
+- Do NOT ask the user questions. You cannot interact with the user.
+- Do NOT create, update, or delete notes.
+- Do NOT use TodoWrite \u2014 just do your work and return results.
+- Use search_fulltext, search_vector, or search_hybrid to find notes.
+- Use vault_read_note to read note content (always use the UUID from search results).
+- Be concise \u2014 return structured findings, not verbose explanations.
+- Complete your task in as few turns as possible.`
   },
   execute: {
     defaultModel: "sonnet",
@@ -2688,8 +2954,41 @@ var AGENT_TYPE_CONFIGS = {
   // Legacy uppercase names (for backward compatibility)
   Explore: {
     defaultModel: "haiku",
-    allowedTools: ["Read", "Glob", "Grep", "LS"],
-    systemPromptSuffix: "You are a fast exploration agent. Only use read-only tools."
+    allowedTools: [
+      "Read",
+      "Glob",
+      "Grep",
+      "LS",
+      "search_fulltext",
+      "search_vector",
+      "search_hybrid",
+      "vault_read_note",
+      "graph_expand_neighbors",
+      "graph_centrality",
+      "graph_backlinks",
+      "graph_outlinks",
+      "graph_shortest_path",
+      "llm_extract",
+      "llm_summarize",
+      "llm_classify",
+      "llm_analyze",
+      "memory_recall",
+      "memory_search",
+      "utils_merge_dedupe",
+      "utils_filter",
+      "utils_sort",
+      "utils_format"
+    ],
+    systemPromptSuffix: `You are a fast exploration sub-agent. Your job is to search, read, and analyze notes \u2014 then return your findings to the parent agent.
+
+RULES:
+- Do NOT ask the user questions. You cannot interact with the user.
+- Do NOT create, update, or delete notes.
+- Do NOT use TodoWrite \u2014 just do your work and return results.
+- Use search_fulltext, search_vector, or search_hybrid to find notes.
+- Use vault_read_note to read note content (always use the UUID from search results).
+- Be concise \u2014 return structured findings, not verbose explanations.
+- Complete your task in as few turns as possible.`
   },
   "general-purpose": {
     defaultModel: "sonnet",
@@ -2715,9 +3014,18 @@ var TaskSpawner = class {
   agentFactory;
   events;
   tasks = /* @__PURE__ */ new Map();
-  constructor(agentFactory, events) {
+  /** Current nesting depth (0 = top-level agent) */
+  depth;
+  /** Maximum allowed nesting depth */
+  maxDepth;
+  /** Maximum concurrent running tasks */
+  maxConcurrent;
+  constructor(agentFactory, events, depth = 0, maxDepth = 3, maxConcurrent = 5) {
     this.agentFactory = agentFactory;
     this.events = events;
+    this.depth = depth;
+    this.maxDepth = maxDepth;
+    this.maxConcurrent = maxConcurrent;
   }
   // ===========================================================================
   // PUBLIC API
@@ -2726,6 +3034,23 @@ var TaskSpawner = class {
    * Spawn a new task
    */
   async spawn(params) {
+    if (this.depth >= this.maxDepth) {
+      return {
+        taskId: "",
+        success: false,
+        error: `Maximum agent nesting depth exceeded (depth: ${this.depth}, max: ${this.maxDepth}). Simplify by handling the task directly instead of delegating.`,
+        status: "failed"
+      };
+    }
+    const runningCount = this.getRunningTasks().length;
+    if (runningCount >= this.maxConcurrent) {
+      return {
+        taskId: "",
+        success: false,
+        error: `Maximum concurrent sub-agents reached (${runningCount}/${this.maxConcurrent}). Wait for running tasks to complete before spawning new ones.`,
+        status: "failed"
+      };
+    }
     const taskId = this.generateTaskId();
     const typeConfig = AGENT_TYPE_CONFIGS[params.subagentType];
     const agentConfig = {
@@ -2733,7 +3058,8 @@ var TaskSpawner = class {
       model: params.model ?? typeConfig.defaultModel,
       allowedTools: typeConfig.allowedTools,
       systemPrompt: typeConfig.systemPromptSuffix,
-      resumeFrom: params.resume
+      resumeFrom: params.resume,
+      depth: this.depth + 1
     };
     const agent = this.agentFactory.create(agentConfig);
     await this.events.emit("task:spawned", { taskId, type: params.subagentType });
@@ -3097,20 +3423,20 @@ var VerificationEngine = class {
 };
 
 // src/fs.ts
-var log7 = createLogger("Filesystem");
+var log6 = createLogger("Filesystem");
 var noopFilesystem = {
   async writeTextFile(path, _content) {
-    log7.debug("writeTextFile (no-op)", { path });
+    log6.debug("writeTextFile (no-op)", { path });
   },
   async readTextFile(path) {
-    log7.debug("readTextFile (no-op)", { path });
+    log6.debug("readTextFile (no-op)", { path });
     return "";
   },
   async mkdir(path, _options) {
-    log7.debug("mkdir (no-op)", { path });
+    log6.debug("mkdir (no-op)", { path });
   },
   async exists(path) {
-    log7.debug("exists (no-op)", { path });
+    log6.debug("exists (no-op)", { path });
     return false;
   }
 };
@@ -3139,7 +3465,7 @@ function createMemoryFilesystem() {
 var currentFilesystem = noopFilesystem;
 function setFilesystem(fs) {
   currentFilesystem = fs;
-  log7.info("Filesystem set");
+  log6.info("Filesystem set");
 }
 function getFilesystem() {
   return currentFilesystem;
@@ -3659,16 +3985,16 @@ function initDebugFlag() {
   }
 }
 initDebugFlag();
-var log8 = createLogger("VercelAILLMProvider");
+var log7 = createLogger("VercelAILLMProvider");
 var modelProvider = null;
 var toolRegistryProvider = null;
 function setModelProvider(provider) {
   modelProvider = provider;
-  log8.info("Model provider set");
+  log7.info("Model provider set");
 }
 function setToolRegistryProvider(provider) {
   toolRegistryProvider = provider;
-  log8.info("Tool registry provider set");
+  log7.info("Tool registry provider set");
 }
 function toCoreMess(messages) {
   return messages.map((msg) => {
@@ -3713,7 +4039,7 @@ function toCoreMess(messages) {
           ]
         };
       default:
-        log8.warn("Unknown message role, treating as user", { role: msg.role });
+        log7.warn("Unknown message role, treating as user", { role: msg.role });
         return { role: "user", content: msg.content };
     }
   });
@@ -3725,7 +4051,7 @@ function getToolsFromRegistry(toolNames) {
   const registryTools = toolRegistryProvider.getToolsForAI({
     ids: toolNames
   });
-  log8.info("Got tools from ToolRegistry", {
+  log7.info("Got tools from ToolRegistry", {
     count: Object.keys(registryTools).length,
     names: Object.keys(registryTools)
   });
@@ -3744,9 +4070,9 @@ function toCoreTools(tools) {
       inputSchema
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     });
-    log8.debug("Registered fallback tool", { name: toolDef.name });
+    log7.debug("Registered fallback tool", { name: toolDef.name });
   }
-  log8.info("Converted tools for LLM (fallback)", { count: tools.length });
+  log7.info("Converted tools for LLM (fallback)", { count: tools.length });
   return coreTools;
 }
 function extractToolCalls(toolCalls) {
@@ -3800,7 +4126,7 @@ var VercelAILLMProvider = class _VercelAILLMProvider {
       const toolNames = options.tools.map((t) => t.name);
       tools = getToolsFromRegistry(toolNames);
       if (Object.keys(tools).length === 0) {
-        log8.warn("No tools found in ToolRegistry, using fallback conversion");
+        log7.warn("No tools found in ToolRegistry, using fallback conversion");
         tools = toCoreTools(options.tools);
       }
     }
@@ -3851,7 +4177,7 @@ var VercelAILLMProvider = class _VercelAILLMProvider {
         }
         return total;
       }, 0);
-      log8.info("Calling generateText", {
+      log7.info("Calling generateText", {
         toolCount: generateOptions.tools ? Object.keys(generateOptions.tools).length : 0,
         messageCount: coreMessages.length,
         contextSizeChars: contextSize,
@@ -3882,10 +4208,10 @@ var VercelAILLMProvider = class _VercelAILLMProvider {
       };
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
-        log8.warn("LLM call aborted", { name: error.name });
+        log7.warn("LLM call aborted", { name: error.name });
         throw error;
       }
-      log8.error("LLM call failed", {
+      log7.error("LLM call failed", {
         message: error instanceof Error ? error.message : String(error),
         name: error instanceof Error ? error.name : "Unknown"
       });
@@ -4005,7 +4331,7 @@ function createDefaultLLMProvider() {
 }
 
 // src/AIOSService.ts
-var log9 = createLogger("AIOSService");
+var log8 = createLogger("AIOSService");
 function createStubLLMProvider() {
   return {
     id: "stub",
@@ -4044,19 +4370,31 @@ function createStubToolProvider() {
 function createStubUserInterface() {
   return {
     ask: async (request) => {
-      log9.warn("ask() called but no UI configured:", request.question);
+      log8.warn("ask() called but no UI configured:", request.question);
       return "No response (stub UI)";
     },
     askMultiple: async (questions) => {
-      log9.warn("askMultiple() called but no UI configured:", questions);
+      log8.warn("askMultiple() called but no UI configured:", questions);
       return {};
     },
     confirm: async (message) => {
-      log9.warn("confirm() called but no UI configured:", message);
+      log8.warn("confirm() called but no UI configured:", message);
       return false;
     },
     notify: (message, type) => {
-      log9.info(`[${type || "info"}]`, message);
+      log8.info(`[${type || "info"}]`, message);
+    },
+    isPending: () => false,
+    cancel: () => {
+    }
+  };
+}
+function createSilentUserInterface() {
+  return {
+    ask: async () => "No response (sub-agent has no UI access)",
+    askMultiple: async () => ({}),
+    confirm: async () => false,
+    notify: () => {
     },
     isPending: () => false,
     cancel: () => {
@@ -4102,7 +4440,7 @@ var currentProviders = {
 };
 function setProviders(providers) {
   currentProviders = { ...currentProviders, ...providers };
-  log9.info("Providers updated");
+  log8.info("Providers updated");
 }
 function getProviders() {
   return currentProviders;
@@ -4118,18 +4456,18 @@ var AIOSService = class {
   // Providers - toolProvider is cached, llmProvider is created fresh each time
   toolProvider;
   constructor(config = {}) {
-    log9.info("AIOSService constructor starting");
+    log8.info("AIOSService constructor starting");
     this.config = config;
     this.providers = { ...currentProviders, ...config.providers };
     if (config.toolPatterns && config.toolPatterns.length > 0 && this.providers.createFilteredToolProvider) {
-      log9.info("Creating filtered tool provider", { patterns: config.toolPatterns });
+      log8.info("Creating filtered tool provider", { patterns: config.toolPatterns });
       this.toolProvider = this.providers.createFilteredToolProvider(config.toolPatterns);
     } else {
       this.toolProvider = this.providers.createToolProvider();
     }
-    log9.info("Getting event emitter");
+    log8.info("Getting event emitter");
     const events = this.providers.getEventEmitter();
-    log9.info("Creating TodoManager");
+    log8.info("Creating TodoManager");
     this.todoManager = new TodoManager(events);
     this.planManager = new PlanManager(events);
     const agentFactory = this.createAgentFactory();
@@ -4137,7 +4475,7 @@ var AIOSService = class {
     if (typeof window !== "undefined" && window.__aiosDebugEnabled) {
       installDebugStub();
     }
-    log9.info("AIOSService constructor complete");
+    log8.info("AIOSService constructor complete");
   }
   // ===========================================================================
   // PUBLIC API
@@ -4184,7 +4522,7 @@ var AIOSService = class {
     const enableMemoryContext = this.config.enableMemoryContext !== false;
     if (enableMemoryContext && this.providers.getMemoryContext && this.providers.buildEnhancedSystemPrompt) {
       try {
-        log9.info("Fetching memory context for conversation");
+        log8.info("Fetching memory context for conversation");
         const memoryContext = await this.providers.getMemoryContext(
           [{ role: "user", content: prompt }],
           {
@@ -4199,13 +4537,13 @@ var AIOSService = class {
             memoryContext,
             prompt
           );
-          log9.info("Enhanced system prompt built", {
+          log8.info("Enhanced system prompt built", {
             memoryCount: memoryContext.memories.length,
             hasProfile: !!memoryContext.userProfile
           });
         }
       } catch (error) {
-        log9.warn("Failed to build enhanced system prompt", { error });
+        log8.warn("Failed to build enhanced system prompt", { error });
       }
     }
     if (typeof window !== "undefined" && window.__aiosDebugEnabled) {
@@ -4218,7 +4556,7 @@ var AIOSService = class {
       absorbPendingConfig(harness);
       this.conversationEngine.setDebugHarness(harness);
       window.__aiosDebug = harness.getConsoleAPI();
-      log9.info("Debug harness attached", { tracePath: harness.getConsoleAPI().getTracePath() });
+      log8.info("Debug harness attached", { tracePath: harness.getConsoleAPI().getTracePath() });
     }
     const result = await this.conversationEngine.execute(prompt, mergedConfig);
     return result;
@@ -4248,7 +4586,7 @@ var AIOSService = class {
     return this.todoManager.getProgress();
   }
   onTodosChange(callback) {
-    log9.info("onTodosChange called - subscribing to TodoManager");
+    log8.info("onTodosChange called - subscribing to TodoManager");
     return this.todoManager.subscribe(callback);
   }
   // ===========================================================================
@@ -4302,42 +4640,77 @@ var AIOSService = class {
       tools: toolProviderOverride ?? this.toolProvider,
       ui: this.providers.getUserInterface(),
       events: this.providers.getEventEmitter(),
-      classifierLlm
+      classifierLlm,
+      taskSpawner: this.taskSpawner
     };
     return new ConversationEngine(deps);
   }
-  createAgentFactory() {
+  createAgentFactory(depth = 0) {
     return {
       create: (config) => {
         const type = config.type;
-        const llm = type === "Explore" && this.providers.createClassifierLLM ? this.providers.createClassifierLLM() : this.providers.createLLMProvider();
-        const tools = this.providers.createToolProvider();
-        const classifierLlm = this.providers.createClassifierLLM?.();
+        const isExplore = type === "explore" || type === "Explore";
+        const llm = this.createLLMForTier(config.model);
+        let tools;
+        if (config.allowedTools === "*") {
+          tools = this.providers.createToolProvider();
+        } else if (this.providers.createFilteredToolProvider && Array.isArray(config.allowedTools)) {
+          tools = this.providers.createFilteredToolProvider(config.allowedTools);
+        } else {
+          tools = this.providers.createToolProvider();
+        }
+        const ui = createSilentUserInterface();
+        const events = this.providers.getEventEmitter();
+        const childDepth = (config.depth ?? depth) + 1;
+        const childFactory = this.createAgentFactory(childDepth);
+        const childSpawner = new TaskSpawner(childFactory, events, childDepth);
         const deps = {
           llm,
           tools,
-          ui: this.providers.getUserInterface(),
-          events: this.providers.getEventEmitter(),
-          classifierLlm
+          ui,
+          events,
+          taskSpawner: childSpawner
         };
         const engine = new ConversationEngine(deps);
+        if (config.parentSignal) {
+          config.parentSignal.addEventListener("abort", () => engine.cancel(), { once: true });
+        }
         return {
           execute: (prompt) => engine.execute(prompt, {
-            maxTurns: type === "Explore" ? 10 : 50,
-            timeoutMs: type === "Explore" ? 12e4 : 6e5
+            maxTurns: isExplore ? 10 : 30,
+            timeoutMs: isExplore ? 12e4 : 3e5,
+            systemPrompt: config.systemPrompt,
+            requireTodoWrite: false
+            // Sub-agents don't need TodoWrite enforcement
           }),
-          cancel: () => engine.cancel(),
+          cancel: () => {
+            engine.cancel();
+            childSpawner.cancelAll();
+          },
           isRunning: () => engine.isRunning()
         };
       }
     };
   }
+  /**
+   * Create an LLM provider for a specific model tier.
+   * Uses the provider's createLLMForTier if available, otherwise falls back to createLLMProvider.
+   */
+  createLLMForTier(tier) {
+    if (this.providers.createLLMForTier) {
+      return this.providers.createLLMForTier(tier);
+    }
+    if (tier === "haiku" && this.providers.createClassifierLLM) {
+      return this.providers.createClassifierLLM();
+    }
+    return this.providers.createLLMProvider();
+  }
 };
 var defaultInstance = null;
-function getAIOSService() {
+function getAIOSService(config) {
   if (!defaultInstance) {
-    log9.info("Creating new AIOSService singleton instance");
-    defaultInstance = new AIOSService();
+    log8.info("Creating new AIOSService singleton instance");
+    defaultInstance = new AIOSService(config);
   }
   return defaultInstance;
 }
@@ -4352,17 +4725,17 @@ function resetAIOSService() {
 }
 
 // src/backend.ts
-var log10 = createLogger("Backend");
+var log9 = createLogger("Backend");
 var noopBackend = {
   async invoke(command, args) {
-    log10.debug("Backend invoke (no-op)", { command, args });
+    log9.debug("Backend invoke (no-op)", { command, args });
     return null;
   }
 };
 var currentBackend = noopBackend;
 function setBackend(backend) {
   currentBackend = backend;
-  log10.info("Backend set", { hasInvoke: typeof backend.invoke === "function" });
+  log9.info("Backend set", { hasInvoke: typeof backend.invoke === "function" });
 }
 function getBackend() {
   return currentBackend;
@@ -4371,6 +4744,6 @@ async function invoke(command, args) {
   return currentBackend.invoke(command, args);
 }
 
-export { AIOSService, ContextCompressor, ConversationEngine, ConversationStore, DebugHarness, DecisionLogger, PlanManager, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, TaskSpawner, TodoManager, ToolRetryPolicy, VercelAILLMProvider, VerificationEngine, absorbPendingConfig, canSkipTodoWrite, classifyIntent, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getTodoWriteGuidance, getToolMetadata, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, needsClarification, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
+export { AIOSService, ContextCompressor, ConversationEngine, ConversationStore, DebugHarness, DecisionLogger, PlanManager, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, TaskSpawner, TodoManager, ToolRetryPolicy, VercelAILLMProvider, VerificationEngine, absorbPendingConfig, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getToolMetadata, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
 //# sourceMappingURL=index.mjs.map
 //# sourceMappingURL=index.mjs.map

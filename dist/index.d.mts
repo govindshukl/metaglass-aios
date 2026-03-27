@@ -17,7 +17,7 @@ interface Message {
     /** Content of the message */
     content: string;
     /** Tool calls made in this message (for assistant messages) */
-    toolCalls?: ToolCall$1[];
+    toolCalls?: ToolCall[];
     /** Tool call ID this message is responding to (for tool messages) */
     toolCallId?: string;
     /** Tool name this message is responding to (for tool messages, required by AI SDK v6) */
@@ -26,7 +26,7 @@ interface Message {
 /**
  * A tool call request from the LLM
  */
-interface ToolCall$1 {
+interface ToolCall {
     /** Unique identifier for this tool call */
     id: string;
     /** Name of the tool to invoke */
@@ -111,7 +111,7 @@ interface LLMResponse {
     /** Text content of the response */
     content: string;
     /** Tool calls requested by the LLM */
-    toolCalls?: ToolCall$1[];
+    toolCalls?: ToolCall[];
     /** Finish reason */
     finishReason: 'stop' | 'tool_calls' | 'length' | 'error';
     /** Token usage statistics */
@@ -411,10 +411,10 @@ interface AIOSEvents {
         message: Message;
     };
     'conversation:tool-call': {
-        toolCall: ToolCall$1;
+        toolCall: ToolCall;
     };
     'conversation:tool-result': {
-        toolCall: ToolCall$1;
+        toolCall: ToolCall;
         result: ToolResult$1;
     };
     'conversation:reflection': {
@@ -476,6 +476,31 @@ interface AIOSEvents {
     'task:completed': {
         taskId: string;
         result: TaskResult;
+    };
+    'conversation:llm-request': {
+        turn: number;
+        messages: Array<{
+            role: string;
+            contentPreview: string;
+            contentLength: number;
+            toolCalls?: string[];
+        }>;
+        toolNames: string[];
+        compressed: boolean;
+    };
+    'conversation:llm-response': {
+        turn: number;
+        content: string;
+        finishReason: string;
+        toolCalls: Array<{
+            name: string;
+            params: Record<string, unknown>;
+        }>;
+        usage?: {
+            promptTokens?: number;
+            completionTokens?: number;
+            totalTokens?: number;
+        };
     };
 }
 
@@ -935,6 +960,114 @@ interface NamespacedStateStore extends StateStore {
 }
 
 /**
+ * TaskSpawner - Sub-agent spawning for AIOS
+ *
+ * Implements the Task tool pattern from Claude Code:
+ * - Spawns isolated sub-agents for specific tasks
+ * - Different agent types with different capabilities
+ * - Background task execution support
+ */
+
+/**
+ * Configuration for creating an agent
+ */
+interface AgentConfig {
+    /** Agent type */
+    type: SubAgentType;
+    /** Model to use */
+    model: ModelTier;
+    /** Allowed tools ('*' for all) */
+    allowedTools: string[] | '*';
+    /** System prompt override */
+    systemPrompt?: string;
+    /** Resume from previous agent ID */
+    resumeFrom?: string;
+    /** Current nesting depth (0 = top-level, incremented for each child) */
+    depth?: number;
+    /** Parent's abort signal for cascading cancellation */
+    parentSignal?: AbortSignal;
+}
+/**
+ * Agent instance interface
+ */
+interface Agent {
+    execute(prompt: string): Promise<ConversationResult>;
+    cancel(): void;
+    isRunning(): boolean;
+}
+/**
+ * Factory for creating agents
+ */
+interface AgentFactory {
+    create(config: AgentConfig): Agent;
+}
+/**
+ * TaskSpawner class
+ *
+ * Manages spawning and tracking of sub-agents.
+ * Supports depth limiting, concurrency caps, and cascading cancellation.
+ */
+declare class TaskSpawner {
+    private agentFactory;
+    private events;
+    private tasks;
+    /** Current nesting depth (0 = top-level agent) */
+    readonly depth: number;
+    /** Maximum allowed nesting depth */
+    readonly maxDepth: number;
+    /** Maximum concurrent running tasks */
+    readonly maxConcurrent: number;
+    constructor(agentFactory: AgentFactory, events: EventEmitter, depth?: number, maxDepth?: number, maxConcurrent?: number);
+    /**
+     * Spawn a new task
+     */
+    spawn(params: TaskParams): Promise<TaskResult>;
+    /**
+     * Check if a task is running
+     */
+    isRunning(taskId: string): boolean;
+    /**
+     * Get result of a task (may be undefined if still running)
+     */
+    getResult(taskId: string): Promise<TaskResult | undefined>;
+    /**
+     * Get all running tasks
+     */
+    getRunningTasks(): Array<{
+        taskId: string;
+        type: SubAgentType;
+    }>;
+    /**
+     * Cancel a running task
+     */
+    cancel(taskId: string): void;
+    /**
+     * Cancel all running tasks
+     */
+    cancelAll(): void;
+    /**
+     * Execute an agent and handle result
+     */
+    private executeAgent;
+    /**
+     * Handle task completion
+     */
+    private handleCompletion;
+    /**
+     * Handle task error
+     */
+    private handleError;
+    /**
+     * Create a TaskResult from ConversationResult
+     */
+    private createTaskResult;
+    /**
+     * Generate a unique task ID
+     */
+    private generateTaskId;
+}
+
+/**
  * ConversationStore - Persistence for conversation state
  *
  * Provides checkpoint/resume functionality for AIOS conversations.
@@ -1225,14 +1358,6 @@ interface ToolMetadata {
     allowsParallelExecution: boolean;
 }
 /**
- * A tool call with name and arguments
- */
-interface ToolCall {
-    id: string;
-    name: string;
-    arguments: Record<string, any>;
-}
-/**
  * Metadata for all known tools
  */
 declare const TOOL_METADATA: Record<string, ToolMetadata>;
@@ -1262,9 +1387,11 @@ declare function toolAllowsParallel(toolName: string): boolean;
  * - Execute all `parallel` tools concurrently (Promise.all)
  * - Execute `sequential` tools one at a time after parallel complete
  */
-declare function partitionToolCalls(toolCalls: ToolCall[]): {
-    parallel: ToolCall[];
-    sequential: ToolCall[];
+declare function partitionToolCalls<T extends {
+    name: string;
+}>(toolCalls: T[]): {
+    parallel: T[];
+    sequential: T[];
 };
 
 /**
@@ -1320,7 +1447,7 @@ interface CheckpointConfig {
  * Phase tags for trace entries.
  * Every entry belongs to exactly one phase.
  */
-type TracePhase = 'init' | 'classification' | 'turn-start' | 'llm-request' | 'llm-response' | 'todowrite-gate' | 'tool-exec' | 'tool-special' | 'error' | 'turn-end' | 'completion' | 'termination';
+type TracePhase = 'init' | 'classification' | 'turn-start' | 'llm-request' | 'llm-response' | 'todowrite-gate' | 'tool-exec' | 'tool-special' | 'loop-detection' | 'error' | 'turn-end' | 'completion' | 'termination';
 /**
  * A single trace entry (one line in the JSONL file)
  */
@@ -1537,6 +1664,8 @@ interface ConversationConfig {
     checkpoint?: CheckpointConfig;
     /** Tool patterns to restrict available tools for this conversation (e.g., ['vault_create_note', 'agent_ask_user']) */
     toolPatterns?: string[];
+    /** Enable parallel execution of independent tools (default: true) */
+    parallelTools?: boolean;
 }
 /**
  * Dependencies for ConversationEngine
@@ -1548,6 +1677,8 @@ interface ConversationEngineDeps {
     events: EventEmitter;
     /** Optional lightweight LLM for intent classification (e.g., Haiku) */
     classifierLlm?: LLMProvider;
+    /** Optional TaskSpawner for sub-agent execution (enables spawn_task tool) */
+    taskSpawner?: TaskSpawner;
 }
 /**
  * ConversationEngine class
@@ -1577,14 +1708,20 @@ declare class ConversationEngine {
     private store;
     private currentTurn;
     private autoCheckpoint;
-    private intentClassification;
     private decisionLogger;
     private toolResults;
     private outputPaths;
     private hasProducedOutput;
     private lastConfig;
     private debugHarness;
-    private llmClassifyFn;
+    private taskSpawner;
+    private baseSystemPrompt;
+    private recentToolSignatures;
+    private lastActiveTodosSnapshot;
+    private staleTodoTurns;
+    private static readonly LOOP_DETECTION_WINDOW;
+    private static readonly STALE_TODO_THRESHOLD;
+    private static readonly STALE_TODO_FORCE_STOP;
     constructor(deps: ConversationEngineDeps);
     /**
      * Attach a debug harness for structured trace logging and step-mode.
@@ -1620,6 +1757,16 @@ declare class ConversationEngine {
      */
     private runLoop;
     /**
+     * Detect if the conversation is looping — repeating the same tool calls
+     * or making no progress on active todos.
+     *
+     * Returns:
+     * - 'none'       — no loop detected, continue normally
+     * - 'nudge'      — stale todos detected, inject a reminder to change approach
+     * - 'force-stop' — severe loop detected, stop the conversation
+     */
+    private detectLoop;
+    /**
      * Execute a single tool call
      */
     private executeTool;
@@ -1639,6 +1786,19 @@ declare class ConversationEngine {
      * to still execute multiple tools per turn.
      */
     private handleBatchTools;
+    /**
+     * Handle spawn_task tool call — delegates to TaskSpawner
+     */
+    private handleSpawnTask;
+    /**
+     * Handle task_status tool call — checks status of background sub-agent tasks
+     */
+    private handleTaskStatus;
+    /**
+     * Process a tool result: trace, emit events, track metadata.
+     * Extracted from the main loop and handleBatchTools to avoid duplication.
+     */
+    private processToolResult;
     /**
      * Format tool result for message history
      */
@@ -1814,103 +1974,6 @@ declare class TodoManager {
 }
 
 /**
- * TaskSpawner - Sub-agent spawning for AIOS
- *
- * Implements the Task tool pattern from Claude Code:
- * - Spawns isolated sub-agents for specific tasks
- * - Different agent types with different capabilities
- * - Background task execution support
- */
-
-/**
- * Configuration for creating an agent
- */
-interface AgentConfig {
-    /** Agent type */
-    type: SubAgentType;
-    /** Model to use */
-    model: ModelTier;
-    /** Allowed tools ('*' for all) */
-    allowedTools: string[] | '*';
-    /** System prompt override */
-    systemPrompt?: string;
-    /** Resume from previous agent ID */
-    resumeFrom?: string;
-}
-/**
- * Agent instance interface
- */
-interface Agent {
-    execute(prompt: string): Promise<ConversationResult>;
-    cancel(): void;
-    isRunning(): boolean;
-}
-/**
- * Factory for creating agents
- */
-interface AgentFactory {
-    create(config: AgentConfig): Agent;
-}
-/**
- * TaskSpawner class
- *
- * Manages spawning and tracking of sub-agents.
- */
-declare class TaskSpawner {
-    private agentFactory;
-    private events;
-    private tasks;
-    constructor(agentFactory: AgentFactory, events: EventEmitter);
-    /**
-     * Spawn a new task
-     */
-    spawn(params: TaskParams): Promise<TaskResult>;
-    /**
-     * Check if a task is running
-     */
-    isRunning(taskId: string): boolean;
-    /**
-     * Get result of a task (may be undefined if still running)
-     */
-    getResult(taskId: string): Promise<TaskResult | undefined>;
-    /**
-     * Get all running tasks
-     */
-    getRunningTasks(): Array<{
-        taskId: string;
-        type: SubAgentType;
-    }>;
-    /**
-     * Cancel a running task
-     */
-    cancel(taskId: string): void;
-    /**
-     * Cancel all running tasks
-     */
-    cancelAll(): void;
-    /**
-     * Execute an agent and handle result
-     */
-    private executeAgent;
-    /**
-     * Handle task completion
-     */
-    private handleCompletion;
-    /**
-     * Handle task error
-     */
-    private handleError;
-    /**
-     * Create a TaskResult from ConversationResult
-     */
-    private createTaskResult;
-    /**
-     * Generate a unique task ID
-     */
-    private generateTaskId;
-}
-
-/**
  * PlanManager - Planning mode for AIOS
  *
  * Implements EnterPlanMode/ExitPlanMode pattern:
@@ -1998,10 +2061,15 @@ declare class PlanManager {
 }
 
 /**
- * ContextCompressor - Manages conversation history to prevent context overflow
+ * ContextCompressor - Rolling summarization for conversation history
  *
- * Compresses older messages by summarizing them while preserving recent context.
- * This ensures long conversations can continue without hitting token limits.
+ * Instead of cliff compression at 70% capacity, this uses incremental
+ * summarization: every N turns, the oldest unsummarized block is compressed
+ * into structured bullet points. This prevents the "compress everything at
+ * once" cliff and preserves temporal ordering across multiple summaries.
+ *
+ * History shape after compression:
+ *   [system] + [user] + [summary_1] + [summary_2] + ... + [last N turns verbatim]
  */
 
 /**
@@ -2022,23 +2090,30 @@ interface CompressionResult {
 declare class ContextCompressor {
     private llm;
     private config;
+    /** Count of unsummarized turns since last compression */
+    private unsummarizedTurnCount;
     constructor(llm: LLMProvider, config?: CompressionConfig);
     /**
-     * Compress conversation history if needed
+     * Compress conversation history using rolling summarization.
      *
-     * @param history - Full conversation history
-     * @param systemPrompt - Optional system prompt (counted separately)
-     * @returns Compressed history with metadata
+     * Called every turn. Checks two conditions:
+     * 1. Have N new turns accumulated since last compression? → Summarize them
+     * 2. Are we over the token budget? → Force-compress oldest unsummarized block
      */
     compress(history: Message[], systemPrompt?: string): Promise<CompressionResult>;
     /**
-     * Parse history into system messages, initial user message, and turns
+     * Parse history into system messages, initial user message, and turns.
+     * Recognizes previous summary messages (prefixed with [Summary of turns ...]).
      */
     private parseHistory;
     /**
-     * Generate a summary of conversation turns
+     * Generate a structured bullet-point summary of conversation turns
      */
     private summarizeTurns;
+    /**
+     * Return no-compression result
+     */
+    private noCompression;
     /**
      * Estimate token count for a list of messages
      */
@@ -2147,106 +2222,6 @@ declare class ToolRetryPolicy {
 }
 
 /**
- * Intent Classifier
- *
- * Classifies user goals by complexity to determine appropriate handling:
- * - TRIVIAL: Direct response, no tools needed
- * - SIMPLE_QUERY: One tool call, no planning needed
- * - MULTI_STEP: Needs TodoWrite for tracking
- * - COMPLEX: Needs clarification + TodoWrite + verification
- *
- * Uses a two-phase approach:
- * 1. Fast path: Regex pattern matching (instant, no LLM call)
- * 2. LLM path: Haiku classification for nuanced understanding
- *
- * Falls back to regex if LLM is unavailable or fails.
- */
-
-/**
- * Task complexity levels
- */
-declare enum TaskComplexity {
-    /** No tools needed - direct LLM response (e.g., "what is 2+2", "hello") */
-    TRIVIAL = "trivial",
-    /** One tool, no planning needed (e.g., "search for X", "find notes") */
-    SIMPLE_QUERY = "simple_query",
-    /** Needs todo, possibly clarification (e.g., "create a note", "plan a trip") */
-    MULTI_STEP = "multi_step",
-    /** Needs clarification + todo + verification (e.g., ambiguous goals, 3+ deliverables) */
-    COMPLEX = "complex"
-}
-/**
- * Suggested actions based on classification
- */
-type SuggestedAction = 'ask_clarification' | 'create_todo' | 'checkpoint_before_execution' | 'verify_output';
-/**
- * Result of intent classification
- */
-interface ClassificationResult {
-    /** Detected task complexity */
-    complexity: TaskComplexity;
-    /** Confidence score (0-1) */
-    confidence: number;
-    /** Suggested actions based on complexity */
-    suggestedActions: SuggestedAction[];
-    /** Human-readable reasoning for the classification */
-    reasoning: string;
-}
-/**
- * Injectable LLM function for classification.
- * Accepts messages and options, returns raw text content.
- * This decouples the classifier from any specific LLM provider.
- */
-type KernelLLMClassifyFn = (messages: Message[], options?: {
-    maxTokens?: number;
-    temperature?: number;
-}) => Promise<{
-    content: string;
-}>;
-/**
- * Classify user intent using a two-phase approach:
- *
- * Phase 1: Regex pre-screen (fast, no LLM call)
- *   - High-confidence TRIVIAL/SIMPLE_QUERY results skip LLM entirely
- *   - This covers greetings, empty input, clear query verbs (~30-40% of inputs)
- *
- * Phase 2: LLM classification (Haiku, ~200-500ms)
- *   - For everything else: creation tasks, ambiguous input, complex goals
- *   - Uses conversation history for richer context understanding
- *
- * Fallback: If LLM fails, returns the regex classification result.
- *
- * @param goal - User's goal/request text
- * @param conversationHistory - Previous messages for context
- * @param llmFn - Optional injectable LLM function (omit for regex-only mode)
- * @returns Classification result with complexity, confidence, and suggestions
- *
- * @example
- * ```typescript
- * // With LLM (recommended)
- * const result = await classifyIntent('plan a trip to Dubai', [], myLLMFn);
- *
- * // Without LLM (regex-only fallback)
- * const result = await classifyIntent('hello', []);
- * ```
- */
-declare function classifyIntent(goal: string, conversationHistory: Message[], llmFn?: KernelLLMClassifyFn): Promise<ClassificationResult>;
-/**
- * Check if a task is simple enough to skip TodoWrite entirely.
- *
- * @param classification - Result from classifyIntent
- * @returns true if TodoWrite can be skipped
- */
-declare function canSkipTodoWrite(classification: ClassificationResult): boolean;
-/**
- * Check if a task needs clarification before proceeding.
- *
- * @param classification - Result from classifyIntent
- * @returns true if clarification should be requested
- */
-declare function needsClarification(classification: ClassificationResult): boolean;
-
-/**
  * VerificationEngine - Post-Completion Quality Assurance
  *
  * Verifies that agent output meets quality standards:
@@ -2345,57 +2320,6 @@ declare class VerificationEngine {
      */
     verify(output: any, context: VerificationContext): Promise<VerificationResult>;
 }
-
-/**
- * TodoWriteGuidance - Gradient Guidance for TodoWrite Usage
- *
- * Provides varying levels of guidance for using TodoWrite based on:
- * - Task complexity level (from IntentClassifier)
- * - Current turn number
- * - Whether output has been produced
- *
- * Levels:
- * - 'none': No guidance needed (trivial tasks, simple queries)
- * - 'soft': Gentle reminder to consider TodoWrite
- * - 'strong': Emphatic recommendation to use TodoWrite
- *
- * Note: We no longer hard-block; this is guidance only.
- */
-
-/**
- * Guidance levels for TodoWrite usage
- */
-type TodoWriteGuidanceLevel = 'none' | 'soft' | 'strong';
-/**
- * Input parameters for determining guidance
- */
-interface TodoWriteGuidanceInput {
-    /** Task complexity from IntentClassifier */
-    complexity: TaskComplexity;
-    /** Current turn number (1-indexed) */
-    turnNumber: number;
-    /** Whether any output has been produced */
-    hasProducedOutput: boolean;
-}
-/**
- * Result of guidance determination
- */
-interface TodoWriteGuidanceResult {
-    /** The guidance level */
-    level: TodoWriteGuidanceLevel;
-    /** Human-readable message (null if no guidance needed) */
-    message: string | null;
-}
-/**
- * Determine the appropriate TodoWrite guidance level based on context
- *
- * Rules:
- * - TRIVIAL / SIMPLE_QUERY: Never need TodoWrite
- * - MULTI_STEP: Soft guidance on turns 1-2, none after
- * - COMPLEX: Strong on turn 1, soft on turn 2-3, none after
- * - If output has been produced, no guidance (already working)
- */
-declare function getTodoWriteGuidance(input: TodoWriteGuidanceInput): TodoWriteGuidanceResult;
 
 /**
  * Tool Exemptions
@@ -2573,16 +2497,6 @@ declare class VercelAILLMProvider {
 declare function createDefaultLLMProvider(): VercelAILLMProvider;
 
 /**
- * AIOS Service
- *
- * Main entry point for the AI Operating System.
- * Provides a high-level API for executing conversations and managing tasks.
- *
- * This service is designed to be pluggable - integrators can provide custom
- * implementations for LLM, tools, UI, and events.
- */
-
-/**
  * Memory context for enhanced prompts
  */
 interface MemoryContext {
@@ -2601,6 +2515,8 @@ interface AIOSProviders {
     createLLMProvider: () => LLMProvider;
     /** Create a lightweight LLM for classification */
     createClassifierLLM?: () => LLMProvider;
+    /** Create an LLM provider for a specific model tier (haiku/sonnet/opus). Falls back to createLLMProvider if not set. */
+    createLLMForTier?: (tier: ModelTier) => LLMProvider;
     /** Create a tool provider */
     createToolProvider: () => ToolProvider;
     /** Create a filtered tool provider */
@@ -2693,8 +2609,13 @@ declare class AIOSService {
     getToolProvider(): ToolProvider;
     private createConversationEngine;
     private createAgentFactory;
+    /**
+     * Create an LLM provider for a specific model tier.
+     * Uses the provider's createLLMForTier if available, otherwise falls back to createLLMProvider.
+     */
+    private createLLMForTier;
 }
-declare function getAIOSService(): AIOSService;
+declare function getAIOSService(config?: AIOSConfig): AIOSService;
 declare function createAIOSService(config?: AIOSConfig): AIOSService;
 declare function resetAIOSService(): void;
 
@@ -2797,4 +2718,4 @@ declare function mkdir(path: string, options?: {
 }): Promise<void>;
 declare function exists(path: string): Promise<boolean>;
 
-export { type AIOSBackend, type AIOSConfig, type AIOSEvents, type AIOSFilesystem, type AIOSProviders, AIOSService, type Agent, type AgentConfig, type AgentFactory, type ChatOptions, type ClassificationResult, type CompositeToolProvider, type CompressionConfig, ContextCompressor, type ConversationConfig, ConversationEngine, type ConversationEngineDeps, type ConversationResult, type ConversationStatus, ConversationStore, type CostLevel, type DebugConsoleAPI, DebugHarness, type DecisionLog, DecisionLogger, type DecisionType, type EventEmitter, type EventHandler, type EventSubscription, type IntentClassificationResult, type IntentSuggestedAction, type InteractionRequest, type JSONSchemaProperty, type KernelLLMClassifyFn, type LLMCapabilities, type LLMProvider, type LLMProviderFactory, type LLMResponse, type LogLevel, type Logger, type MemoryContext, type Message, type MessageRole, type MetadataCategory, type ModelProvider, type ModelTier, type NamespacedStateStore, type NotificationType, type PlanApprovalStatus, PlanManager, type PlanState, type ProviderType, type Question, type QuestionOption, type ReflectionResultPayload, type RetryConfig$1 as RetryConfig, type RetryOptions, type RetryResult, type SideEffects, type StateChangeCallback, type StateStore, type StateSubscription, type StructuredToolResult, type SubAgentType, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, type TaskComplexityLevel, type TaskParams, type TaskResult, TaskSpawner, type Todo$1 as Todo, type TodoChangeCallback, TodoManager, type TodoResult, type TodoStatus$1 as TodoStatus, type Tool, type ToolCall$1 as ToolCall, type ToolCategory, type ToolContext, type ToolDefinition, type ToolFollowUpAction, type ToolMetadata, type ToolParameters, type ToolProvider, type ToolRegistry, type ToolRegistryProvider, type ToolResult$1 as ToolResult, ToolRetryPolicy, type ToolUserInterface, type TraceEntry, type TraceIndex, type TracePhase, type UserInterface, type UserInterfaceFactory, VercelAILLMProvider, type VercelAILLMProviderConfig, VerificationEngine, absorbPendingConfig, canSkipTodoWrite, classifyIntent, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getTodoWriteGuidance, getToolMetadata, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, needsClarification, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
+export { type AIOSBackend, type AIOSConfig, type AIOSEvents, type AIOSFilesystem, type AIOSProviders, AIOSService, type Agent, type AgentConfig, type AgentFactory, type ChatOptions, type CompositeToolProvider, type CompressionConfig, ContextCompressor, type ConversationConfig, ConversationEngine, type ConversationEngineDeps, type ConversationResult, type ConversationStatus, ConversationStore, type CostLevel, type DebugConsoleAPI, DebugHarness, type DecisionLog, DecisionLogger, type DecisionType, type EventEmitter, type EventHandler, type EventSubscription, type IntentClassificationResult, type IntentSuggestedAction, type InteractionRequest, type JSONSchemaProperty, type LLMCapabilities, type LLMProvider, type LLMProviderFactory, type LLMResponse, type LogLevel, type Logger, type MemoryContext, type Message, type MessageRole, type MetadataCategory, type ModelProvider, type ModelTier, type NamespacedStateStore, type NotificationType, type PlanApprovalStatus, PlanManager, type PlanState, type ProviderType, type Question, type QuestionOption, type ReflectionResultPayload, type RetryConfig$1 as RetryConfig, type RetryOptions, type RetryResult, type SideEffects, type StateChangeCallback, type StateStore, type StateSubscription, type StructuredToolResult, type SubAgentType, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, type TaskComplexityLevel, type TaskParams, type TaskResult, TaskSpawner, type Todo$1 as Todo, type TodoChangeCallback, TodoManager, type TodoResult, type TodoStatus$1 as TodoStatus, type Tool, type ToolCall, type ToolCategory, type ToolContext, type ToolDefinition, type ToolFollowUpAction, type ToolMetadata, type ToolParameters, type ToolProvider, type ToolRegistry, type ToolRegistryProvider, type ToolResult$1 as ToolResult, ToolRetryPolicy, type ToolUserInterface, type TraceEntry, type TraceIndex, type TracePhase, type UserInterface, type UserInterfaceFactory, VercelAILLMProvider, type VercelAILLMProviderConfig, VerificationEngine, absorbPendingConfig, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getToolMetadata, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
