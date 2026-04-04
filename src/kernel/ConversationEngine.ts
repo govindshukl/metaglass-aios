@@ -28,6 +28,9 @@ import type { TaskSpawner } from './TaskSpawner';
 import { createLogger } from '../logger';
 import { ContextCompressor } from './ContextCompressor';
 import { ToolRetryPolicy } from './ToolRetryPolicy';
+import { LoopDetector, type TodoSnapshot } from './LoopDetector';
+import { ContextPruner } from './ContextPruner';
+import { formatToolResult as formatToolResultUnified, truncateToolResult as truncateToolResultUnified } from './ToolResultFormatter';
 import { ConversationStore, conversationStore } from './ConversationStore';
 import { filterExemptTools, filterActionTools } from './ToolExemptions';
 import { DecisionLogger, type DecisionLog } from './DecisionLogger';
@@ -276,13 +279,11 @@ export class ConversationEngine {
   // Base system prompt (immutable) — state is appended dynamically each turn
   private baseSystemPrompt: string = '';
 
-  // Loop detection state
-  private recentToolSignatures: string[] = [];  // Tool call signatures per turn (last N turns)
-  private lastActiveTodosSnapshot: string = ''; // Serialized active todos for stale detection
-  private staleTodoTurns: number = 0;           // Consecutive turns with unchanged active todos
-  private static readonly LOOP_DETECTION_WINDOW = 4;   // Check last N turns for repetition
-  private static readonly STALE_TODO_THRESHOLD = 3;     // Nudge after N stale turns
-  private static readonly STALE_TODO_FORCE_STOP = 6;    // Force-stop after N stale turns
+  // Loop detection — extracted to LoopDetector (Phase 3)
+  private loopDetector: LoopDetector;
+
+  // Context pruning — cache-TTL pruning of old tool results (Phase 3)
+  private contextPruner: ContextPruner;
 
   constructor(deps: ConversationEngineDeps) {
     this.llm = deps.llm;
@@ -293,6 +294,12 @@ export class ConversationEngine {
 
     // Initialize context compressor
     this.contextCompressor = new ContextCompressor(this.llm);
+
+    // Initialize loop detector (Phase 3 — extracted from inline detection)
+    this.loopDetector = new LoopDetector();
+
+    // Initialize context pruner (Phase 3 — cache-TTL pruning of old tool results)
+    this.contextPruner = new ContextPruner();
 
     // Initialize retry policy for tool execution
     this.retryPolicy = new ToolRetryPolicy();
@@ -414,6 +421,8 @@ export class ConversationEngine {
     this.outputPaths = [];
     this.hasProducedOutput = false;
     this.decisionLogger.clear();
+    this.loopDetector.reset();
+    this.contextPruner.reset();
 
     // Update retry policy if config provided
     if (config?.retry) {
@@ -553,14 +562,6 @@ export class ConversationEngine {
             .join('\n');
 
           if (activeTodos) {
-            // Track stale todo detection
-            if (activeTodos === this.lastActiveTodosSnapshot) {
-              this.staleTodoTurns++;
-            } else {
-              this.staleTodoTurns = 0;
-              this.lastActiveTodosSnapshot = activeTodos;
-            }
-
             stateParts.push(`Active Tasks:\n${activeTodos}`);
           }
         }
@@ -780,6 +781,7 @@ export class ConversationEngine {
 
         if (hasTodoWrite) {
           this.hasPlan = true;
+          this.loopDetector.setHasPlan(true);
           log.info('TodoWrite called - plan established', { turn: this.currentTurn });
 
           this.debugHarness?.trace('todowrite-gate', 'plan-established', {
@@ -848,7 +850,7 @@ export class ConversationEngine {
 
               this.history.push({
                 role: 'tool',
-                content: this.truncateToolResult(this.formatToolResult(result), this.lastConfig?.resultMaxChars ?? 100_000),
+                content: truncateToolResultUnified(formatToolResultUnified(result), this.lastConfig?.resultMaxChars ?? 100_000),
                 toolCallId: toolCall.id,
                 toolName: toolCall.name,
               });
@@ -1062,7 +1064,7 @@ export class ConversationEngine {
         if (entry) {
           this.history.push({
             role: 'tool',
-            content: this.truncateToolResult(this.formatToolResult(entry.result), this.lastConfig?.resultMaxChars ?? 100_000),
+            content: truncateToolResultUnified(formatToolResultUnified(entry.result), this.lastConfig?.resultMaxChars ?? 100_000),
             toolCallId: tc.id,
             toolName: tc.name,
           });
@@ -1079,43 +1081,67 @@ export class ConversationEngine {
       }
 
       // =========================================================================
-      // LOOP DETECTION — detect repetitive tool calls and stale todos
+      // LOOP DETECTION — via extracted LoopDetector (Phase 3)
       // =========================================================================
-      const loopAction = this.detectLoop(response.toolCalls ?? []);
+      const todoSnapshot: TodoSnapshot = {
+        activeTodos: this.currentTodos
+          .filter(t => t.status !== 'completed')
+          .map(t => t.content),
+        completedCount: this.currentTodos.filter(t => t.status === 'completed').length,
+      };
 
-      if (loopAction === 'force-stop') {
+      this.loopDetector.recordTurn(
+        (response.toolCalls ?? []).map(tc => ({ name: tc.name, params: tc.params })),
+        todoSnapshot
+      );
+
+      const loopResult = this.loopDetector.evaluate();
+
+      if (loopResult.action === 'force_stop') {
         log.warn('Loop detected — force-stopping conversation', {
           turn: this.currentTurn,
-          staleTodoTurns: this.staleTodoTurns,
-          recentSignatures: this.recentToolSignatures,
+          reason: loopResult.reason,
         });
         this.debugHarness?.trace('termination', 'loop-detected-force-stop', {
           turn: this.currentTurn,
-          staleTodoTurns: this.staleTodoTurns,
-          recentSignatures: this.recentToolSignatures,
+          reason: loopResult.reason,
         });
+
+        // Push a clean assistant message so the UI shows why the conversation stopped
+        const forceStopMessage = 'I detected that I was repeating the same actions without making progress, so I stopped. ' + loopResult.reason;
+        this.history.push({ role: 'assistant', content: forceStopMessage });
+
         this.status = 'completed';
-        return this.createResult(
-          true,
-          'Conversation stopped: repeated actions detected without progress. Returning results gathered so far.',
-          Date.now() - startTime,
-          'completed'
-        );
+        const forceStopResult = this.createResult(true, undefined, Date.now() - startTime, 'completed');
+        // Emit conversation:completed so the UI re-enables input
+        await this.events.emit('conversation:completed', { result: forceStopResult });
+        return forceStopResult;
       }
 
-      if (loopAction === 'nudge') {
+      if (loopResult.action === 'nudge') {
         log.info('Loop detected — injecting nudge', {
           turn: this.currentTurn,
-          staleTodoTurns: this.staleTodoTurns,
+          staleTurns: loopResult.staleTurns,
         });
         this.debugHarness?.trace('loop-detection', 'nudge-injected', {
           turn: this.currentTurn,
-          staleTodoTurns: this.staleTodoTurns,
-          recentSignatures: this.recentToolSignatures,
+          staleTurns: loopResult.staleTurns,
         });
         this.history.push({
           role: 'user',
-          content: `[System Reminder] You appear to be repeating the same actions without making progress. Your active tasks have not changed in ${this.staleTodoTurns} turns. Either:\n1. Mark your current tasks as completed with TodoWrite and present results to the user\n2. Change your approach — try different tools or queries\n3. If you have enough information, stop calling tools and respond with your findings`,
+          content: loopResult.message,
+        });
+      }
+
+      // =========================================================================
+      // CONTEXT PRUNING — trim old large tool results (Phase 3)
+      // =========================================================================
+      this.contextPruner.trackMessages(this.history);
+      const pruneResult = this.contextPruner.prune(this.history);
+      if (pruneResult.prunedCount > 0) {
+        log.info('Context pruning applied', {
+          prunedCount: pruneResult.prunedCount,
+          charsSaved: pruneResult.charsSaved,
         });
       }
 
@@ -1156,68 +1182,10 @@ export class ConversationEngine {
   }
 
   // ===========================================================================
-  // LOOP DETECTION
+  // LOOP DETECTION — delegated to LoopDetector (Phase 3)
   // ===========================================================================
-
-  /**
-   * Detect if the conversation is looping — repeating the same tool calls
-   * or making no progress on active todos.
-   *
-   * Returns:
-   * - 'none'       — no loop detected, continue normally
-   * - 'nudge'      — stale todos detected, inject a reminder to change approach
-   * - 'force-stop' — severe loop detected, stop the conversation
-   */
-  private detectLoop(toolCalls: ToolCall[]): 'none' | 'nudge' | 'force-stop' {
-    // Build a signature for this turn's tool calls (sorted for order independence)
-    const turnSignature = toolCalls
-      .map(tc => `${tc.name}:${JSON.stringify(tc.params)}`)
-      .sort()
-      .join('|');
-
-    this.recentToolSignatures.push(turnSignature);
-
-    // Keep only the last N signatures
-    if (this.recentToolSignatures.length > ConversationEngine.LOOP_DETECTION_WINDOW) {
-      this.recentToolSignatures.shift();
-    }
-
-    // Check 1: Exact same tool signature repeated for the entire window
-    if (this.recentToolSignatures.length >= ConversationEngine.LOOP_DETECTION_WINDOW) {
-      const allSame = this.recentToolSignatures.every(s => s === this.recentToolSignatures[0]);
-      if (allSame) {
-        log.warn('Exact tool repetition detected', {
-          window: ConversationEngine.LOOP_DETECTION_WINDOW,
-          signature: this.recentToolSignatures[0]?.substring(0, 200),
-        });
-        return 'force-stop';
-      }
-    }
-
-    // Check 2: Same tool name repeated with minor param variations (e.g., re-reading same note)
-    if (this.recentToolSignatures.length >= ConversationEngine.LOOP_DETECTION_WINDOW) {
-      const toolNames = this.recentToolSignatures.map(s => s.split(':')[0]);
-      const allSameToolName = toolNames.every(n => n === toolNames[0]);
-      if (allSameToolName && this.staleTodoTurns >= ConversationEngine.STALE_TODO_THRESHOLD) {
-        log.warn('Same tool type with stale todos', {
-          toolName: toolNames[0],
-          staleTurns: this.staleTodoTurns,
-        });
-        return 'force-stop';
-      }
-    }
-
-    // Check 3: Stale todos — active tasks haven't changed
-    if (this.staleTodoTurns >= ConversationEngine.STALE_TODO_FORCE_STOP) {
-      return 'force-stop';
-    }
-
-    if (this.staleTodoTurns >= ConversationEngine.STALE_TODO_THRESHOLD) {
-      return 'nudge';
-    }
-
-    return 'none';
-  }
+  // The old detectLoop() method has been replaced by this.loopDetector
+  // which is called in the main loop after tool execution.
 
   // ===========================================================================
   // TOOL EXECUTION
@@ -1532,7 +1500,7 @@ export class ConversationEngine {
     // Format combined results
     const combinedParts: string[] = [`[BATCH] Executed ${results.length} tool(s):`];
     for (const { tool, result } of results) {
-      const formatted = this.truncateToolResult(this.formatToolResult(result), this.lastConfig?.resultMaxChars ?? 100_000);
+      const formatted = truncateToolResultUnified(formatToolResultUnified(result), this.lastConfig?.resultMaxChars ?? 100_000);
       combinedParts.push(`\n--- ${tool} ---`);
       combinedParts.push(formatted);
     }
@@ -1736,18 +1704,12 @@ export class ConversationEngine {
   // HELPERS
   // ===========================================================================
 
-  /**
-   * Format tool result for message history
-   */
-  /**
-   * Format a tool result for the LLM
-   *
-   * Priority:
-   * 1. Structured result (if available) - formatted for better LLM parsing
-   * 2. Observation string (human-readable summary)
-   * 3. JSON data fallback
-   */
-  private formatToolResult(result: ToolResult): string {
+  // formatToolResult() and truncateToolResult() have been extracted to
+  // ToolResultFormatter.ts (Phase 3, Step 8) and are imported as
+  // formatToolResultUnified / truncateToolResultUnified at the top of this file.
+  // The old implementations below are kept as deprecated references.
+  // TODO: Remove after integration is validated.
+  private _deprecated_formatToolResult(result: ToolResult): string {
     // 0. For agent_ask_user results, always prefer the observation string which
     //    contains the actual user answers. The generic structured result may
     //    strip the answers (see buildDataResult fallback).
@@ -1858,7 +1820,7 @@ export class ConversationEngine {
    * Truncate a formatted tool result if it exceeds the configured max chars.
    * Uses 70/30 head/tail strategy to preserve beginning and end context.
    */
-  private truncateToolResult(content: string, maxChars: number): string {
+  private _deprecated_truncateToolResult(content: string, maxChars: number): string {
     if (content.length <= maxChars) {
       return content;
     }

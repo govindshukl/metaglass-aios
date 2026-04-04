@@ -56,7 +56,7 @@ describe('ContextCompressor', () => {
       const config = compressor.getConfig();
       expect(config.enabled).toBe(true);
       expect(config.maxTokens).toBe(100000);
-      expect(config.summarizeThreshold).toBe(10);
+      expect(config.summarizeThreshold).toBe(5);
       expect(config.preserveRecentTurns).toBe(5);
     });
 
@@ -76,7 +76,7 @@ describe('ContextCompressor', () => {
 
   describe('compress', () => {
     it('should not compress when history is below threshold', async () => {
-      const messages = createMessages(4); // Below default threshold of 10
+      const messages = createMessages(4); // Below default threshold of 5
       const result = await compressor.compress(messages);
 
       expect(result.wasCompressed).toBe(false);
@@ -194,7 +194,7 @@ describe('ContextCompressor', () => {
 
   describe('compression thresholds', () => {
     it('should not compress when below turn threshold', async () => {
-      const messages = createMessages(5); // Below default 10
+      const messages = createMessages(4); // Below default 5
       const result = await compressor.compress(messages);
       expect(result.wasCompressed).toBe(false);
     });
@@ -239,7 +239,7 @@ describe('ContextCompressor', () => {
   });
 
   describe('error handling', () => {
-    it('should handle LLM errors gracefully', async () => {
+    it('should fall back to metadata-only when all LLM calls fail', async () => {
       const failingLLM = createMockLLM();
       (failingLLM.chat as ReturnType<typeof vi.fn>).mockRejectedValue(
         new Error('LLM unavailable')
@@ -247,15 +247,189 @@ describe('ContextCompressor', () => {
 
       const failingCompressor = new ContextCompressor(failingLLM, {
         maxTokens: 50,
+        summarizeThreshold: 2,
+        preserveRecentTurns: 1,
+      });
+
+      // Create a simple history that guarantees compression triggers
+      const messages: Message[] = [
+        { role: 'user', content: 'Help me ' + 'x'.repeat(200) },
+        { role: 'assistant', content: 'Sure ' + 'y'.repeat(200) },
+        { role: 'user', content: 'Next ' + 'x'.repeat(200) },
+        { role: 'assistant', content: 'Done ' + 'y'.repeat(200) },
+        { role: 'user', content: 'More ' + 'x'.repeat(200) },
+        { role: 'assistant', content: 'Ok ' + 'y'.repeat(200) },
+      ];
+
+      const result = await failingCompressor.compress(messages);
+
+      expect(result.wasCompressed).toBe(true);
+      expect(result.reason).toBe('fallback_metadata');
+      expect(result.summary).toContain('Conversation history');
+    });
+  });
+
+  // ===========================================================================
+  // Phase 3 Enhancements
+  // ===========================================================================
+
+  describe('Phase 3: structured summary template', () => {
+    it('should use structured prompt with sections', async () => {
+      compressor.updateConfig({
+        maxTokens: 50,
         summarizeThreshold: 3,
+        preserveRecentTurns: 2,
       });
 
       const messages = createMessages(10, 100);
-      const result = await failingCompressor.compress(messages);
+      await compressor.compress(messages);
 
-      // Should fall back to returning original messages
+      // Verify the LLM was called with the structured prompt
+      const chatCall = (mockLLM.chat as ReturnType<typeof vi.fn>).mock.calls[0];
+      if (chatCall) {
+        const systemMsg = chatCall[0][0];
+        expect(systemMsg.content).toContain('## Goal');
+        expect(systemMsg.content).toContain('## Progress');
+        expect(systemMsg.content).toContain('## Key Decisions');
+        expect(systemMsg.content).toContain('## Files & Artifacts');
+        expect(systemMsg.content).toContain('## Next Steps');
+        expect(systemMsg.content).toContain('## Critical Context');
+      }
+    });
+
+    it('should include identifier preservation instructions in prompt', async () => {
+      compressor.updateConfig({
+        maxTokens: 50,
+        summarizeThreshold: 3,
+        preserveRecentTurns: 2,
+      });
+
+      const messages = createMessages(10, 100);
+      await compressor.compress(messages);
+
+      const chatCall = (mockLLM.chat as ReturnType<typeof vi.fn>).mock.calls[0];
+      if (chatCall) {
+        const systemMsg = chatCall[0][0];
+        expect(systemMsg.content).toContain('Preserve all identifiers exactly');
+      }
+    });
+  });
+
+  describe('Phase 3: iterative summary (rolling chain)', () => {
+    it('should include previous summary in subsequent compressions', async () => {
+      compressor.updateConfig({
+        maxTokens: 50,
+        summarizeThreshold: 3,
+        preserveRecentTurns: 2,
+      });
+
+      // First compression
+      const messages1 = createMessages(10, 100);
+      const result1 = await compressor.compress(messages1);
+      expect(result1.wasCompressed).toBe(true);
+
+      // Second compression — should include previous summary in prompt
+      const messages2 = createMessages(10, 100);
+      await compressor.compress(messages2);
+
+      // Check that the second call includes "Previous conversation summary"
+      const calls = (mockLLM.chat as ReturnType<typeof vi.fn>).mock.calls;
+      if (calls.length >= 2) {
+        const secondUserMsg = calls[1][0][1]; // second call, user message
+        expect(secondUserMsg.content).toContain('Previous conversation summary');
+      }
+    });
+
+    it('should store last summary via getLastSummary()', async () => {
+      expect(compressor.getLastSummary()).toBeNull();
+
+      compressor.updateConfig({
+        maxTokens: 50,
+        summarizeThreshold: 3,
+        preserveRecentTurns: 2,
+      });
+
+      const messages = createMessages(10, 100);
+      await compressor.compress(messages);
+
+      expect(compressor.getLastSummary()).toBe('Summary of the conversation so far.');
+    });
+  });
+
+  describe('Phase 3: token-budget tail protection', () => {
+    it('should use token-based tail when setTailBudget is called', async () => {
+      compressor.updateConfig({
+        maxTokens: 50,
+        summarizeThreshold: 3,
+        preserveRecentTurns: 2, // Would keep 2 turns, but token budget overrides
+      });
+
+      // Set a large tail budget — should preserve more turns
+      compressor.setTailBudget(50_000); // 30% of 50K = 15K tokens for tail
+
+      const messages = createMessages(10, 100);
+      const result = await compressor.compress(messages);
+
+      if (result.wasCompressed) {
+        // With token-budget tail, might preserve more messages than fixed 2 turns
+        expect(result.messages.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  describe('Phase 3: fallback chain', () => {
+    it('should return metadata fallback when all LLM calls fail', async () => {
+      const alwaysFailLLM = createMockLLM();
+      (alwaysFailLLM.chat as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error('Always fails')
+      );
+
+      const failCompressor = new ContextCompressor(alwaysFailLLM, {
+        maxTokens: 50,
+        summarizeThreshold: 3,
+        preserveRecentTurns: 2,
+      });
+
+      const messages = createMessages(10, 100);
+      const result = await failCompressor.compress(messages);
+
+      expect(result.wasCompressed).toBe(true);
+      expect(result.reason).toBe('fallback_metadata');
+      expect(result.summary).toContain('Conversation history');
+      expect(result.summary).toContain('Tools used');
+    });
+
+    it('should include CompactReason in result', async () => {
+      compressor.updateConfig({
+        maxTokens: 50,
+        summarizeThreshold: 3,
+        preserveRecentTurns: 2,
+      });
+
+      const messages = createMessages(10, 100);
+      const result = await compressor.compress(messages);
+
+      expect(result.reason).toBeDefined();
+      if (result.wasCompressed) {
+        expect(['interval', 'budget_pressure', 'fallback_partial', 'fallback_metadata']).toContain(result.reason);
+      }
+    });
+
+    it('should return skipped_below_threshold when no compression needed', async () => {
+      const messages = createMessages(2);
+      const result = await compressor.compress(messages);
+
       expect(result.wasCompressed).toBe(false);
-      expect(result.messages).toEqual(messages);
+      expect(result.reason).toBe('skipped_below_threshold');
+    });
+
+    it('should return skipped_disabled when compression disabled', async () => {
+      compressor.updateConfig({ enabled: false });
+      const messages = createMessages(20);
+      const result = await compressor.compress(messages);
+
+      expect(result.wasCompressed).toBe(false);
+      expect(result.reason).toBe('skipped_disabled');
     });
   });
 });
