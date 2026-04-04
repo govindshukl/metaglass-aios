@@ -31,7 +31,8 @@ import { ToolRetryPolicy } from './ToolRetryPolicy';
 import { ConversationStore, conversationStore } from './ConversationStore';
 import { filterExemptTools, filterActionTools } from './ToolExemptions';
 import { DecisionLogger, type DecisionLog } from './DecisionLogger';
-import { getToolMetadata, partitionToolCalls } from './ToolMetadataRegistry';
+import { getToolMetadata, partitionToolCalls, deduplicateToolCalls } from './ToolMetadataRegistry';
+import { repairToolMessages } from './MessageRepair';
 import { type CheckpointConfig } from './CheckpointManager';
 import type { DebugHarness } from './DebugHarness';
 
@@ -68,12 +69,17 @@ export interface ConversationConfig {
   toolPatterns?: string[];
   /** Enable parallel execution of independent tools (default: true) */
   parallelTools?: boolean;
+  /** Explicit list of visible tool API names. When provided, replaces the default ACTIVE_TOOLS filter.
+   *  Set by ToolPolicyEngine from the application layer. */
+  visibleTools?: string[];
+  /** Maximum characters per tool result before truncation (default: 100_000) */
+  resultMaxChars?: number;
 }
 
 /**
  * Default configuration values
  */
-const DEFAULT_CONFIG: Required<Omit<ConversationConfig, 'signal' | 'systemPrompt' | 'compression' | 'retry' | 'checkpoint' | 'toolPatterns'>> = {
+const DEFAULT_CONFIG: Required<Omit<ConversationConfig, 'signal' | 'systemPrompt' | 'compression' | 'retry' | 'checkpoint' | 'toolPatterns' | 'visibleTools' | 'resultMaxChars'>> = {
   maxTurns: 50,
   timeoutMs: 600000, // 10 minutes (increased from 5 min to handle slow LLM responses)
   maxTokensPerTurn: 4096,
@@ -121,6 +127,9 @@ const ACTIVE_TOOLS: ReadonlySet<string> = new Set([
   // Web
   'web_search',
   'web_fetch',
+
+  // Skills (on-demand skill loading from catalog)
+  'skill_load',
 ]);
 
 // =============================================================================
@@ -256,7 +265,7 @@ export class ConversationEngine {
   private hasProducedOutput: boolean = false;
 
   // Store last config for resume functionality
-  private lastConfig: { maxTurns: number; timeoutMs: number; maxTokensPerTurn: number; requireTodoWrite: boolean; parallelTools: boolean; systemPrompt?: string; signal?: AbortSignal; compression?: CompressionConfig } | null = null;
+  private lastConfig: { maxTurns: number; timeoutMs: number; maxTokensPerTurn: number; requireTodoWrite: boolean; parallelTools: boolean; systemPrompt?: string; signal?: AbortSignal; compression?: CompressionConfig; resultMaxChars?: number } | null = null;
 
   // Debug harness (optional — zero overhead when not attached)
   private debugHarness: DebugHarness | null = null;
@@ -335,6 +344,8 @@ export class ConversationEngine {
       systemPrompt: config?.systemPrompt,
       signal: config?.signal,
       compression: config?.compression,
+      visibleTools: config?.visibleTools,
+      resultMaxChars: config?.resultMaxChars ?? 100_000,
     };
     log.info('Merged config', { maxTurns: cfg.maxTurns, timeoutMs: cfg.timeoutMs, requireTodoWrite: cfg.requireTodoWrite });
 
@@ -484,7 +495,7 @@ export class ConversationEngine {
   /**
    * Main conversation loop
    */
-  private async runLoop(config: { maxTurns: number; timeoutMs: number; maxTokensPerTurn: number; requireTodoWrite: boolean; parallelTools: boolean; systemPrompt?: string; signal?: AbortSignal; compression?: CompressionConfig }, startTime: number): Promise<ConversationResult> {
+  private async runLoop(config: { maxTurns: number; timeoutMs: number; maxTokensPerTurn: number; requireTodoWrite: boolean; parallelTools: boolean; systemPrompt?: string; signal?: AbortSignal; compression?: CompressionConfig; visibleTools?: string[]; resultMaxChars?: number }, startTime: number): Promise<ConversationResult> {
     // Use class-level turn tracking for checkpoint/resume support
     // If resuming, currentTurn will already be set from the snapshot
 
@@ -572,10 +583,21 @@ export class ConversationEngine {
           return this.createResult(false, 'Conversation timeout', Date.now() - startTime, 'failed');
         }
 
-        // Filter tools to ACTIVE_TOOLS set — all tools remain registered for
-        // execution (sub-agents, batch_tools, etc.) but only the active set is
-        // shown to the LLM to reduce schema overhead and decision complexity.
-        const toolsList = this.tools.list().filter(t => ACTIVE_TOOLS.has(t.name));
+        // TOOL VISIBILITY FILTER — uses policy-resolved visibleTools when available,
+        // falls back to hardcoded ACTIVE_TOOLS for backward compatibility.
+        // All tools remain registered for execution (sub-agents, batch_tools, etc.)
+        // but only the visible set is shown to the LLM.
+        const visibleSet = config?.visibleTools
+          ? new Set(config.visibleTools)
+          : ACTIVE_TOOLS;
+        const toolsList = this.tools.list().filter(t => visibleSet.has(t.name));
+        log.info('Tool visibility filter', {
+          usingPolicy: !!config?.visibleTools,
+          policyToolCount: config?.visibleTools?.length,
+          registeredToolCount: this.tools.list().length,
+          visibleToolCount: toolsList.length,
+          visibleToolNames: toolsList.map(t => t.name),
+        });
 
         // Inject sub-agent tools if TaskSpawner is available
         if (this.taskSpawner) {
@@ -621,6 +643,9 @@ export class ConversationEngine {
         }
 
         // Trace: LLM request
+        // Repair orphaned tool messages before LLM call
+        messagesToSend = repairToolMessages(messagesToSend);
+
         this.debugHarness?.trace('llm-request', 'sending-to-llm', {
           turn: this.currentTurn,
           messageCount: messagesToSend.length,
@@ -823,7 +848,7 @@ export class ConversationEngine {
 
               this.history.push({
                 role: 'tool',
-                content: this.formatToolResult(result),
+                content: this.truncateToolResult(this.formatToolResult(result), this.lastConfig?.resultMaxChars ?? 100_000),
                 toolCallId: toolCall.id,
                 toolName: toolCall.name,
               });
@@ -851,16 +876,37 @@ export class ConversationEngine {
       // NO TOOL CALLS = LLM IS DONE (unless tools were filtered out)
       // =========================================================================
       if (!response.toolCalls || response.toolCalls.length === 0) {
-        // If finishReason was 'tool_calls' but we have no tools, it means they were
-        // all filtered out (e.g., non-existent tools). Continue the loop so the LLM
-        // can retry with different tools on the next turn.
+        // If finishReason was 'tool_calls' but we have no tools, it means the LLM
+        // tried to call tools not in the visible set. Instead of retrying (which
+        // loops indefinitely), treat this as a completion with a policy message.
         if (response.finishReason === 'tool_calls') {
-          log.warn('All tool calls were filtered out — continuing loop', { turn: this.currentTurn });
-          this.debugHarness?.trace('turn-end', 'tools-filtered-retry', {
+          log.warn('All tool calls were filtered out — completing with policy message', { turn: this.currentTurn });
+
+          // Remove the assistant message we already pushed (it may have content
+          // mixed with invisible tool calls, which creates invalid history).
+          const lastMsg = this.history[this.history.length - 1];
+          if (lastMsg?.role === 'assistant') {
+            this.history.pop();
+          }
+
+          // Build a clear explanation and add it as an assistant message
+          const policyMessage = response.content
+            ? `${response.content}\n\n(Note: I attempted to use tools that are not available in this session's tool profile. The requested action cannot be performed with the current permissions.)`
+            : 'I attempted to use tools that are not available in this session\'s tool profile. The requested action cannot be performed with the current permissions. Please adjust the tool profile in settings if you need write access.';
+
+          // Push a clean assistant message so createResult can find it
+          this.history.push({
+            role: 'assistant',
+            content: policyMessage,
+          });
+
+          this.debugHarness?.trace('turn-end', 'tools-filtered-policy-stop', {
             turn: this.currentTurn,
             finishReason: response.finishReason,
           });
-          continue;
+
+          this.status = 'completed';
+          return this.createResult(true, undefined, Date.now() - startTime, 'completed');
         }
 
         // Complete - model decided to stop
@@ -884,13 +930,22 @@ export class ConversationEngine {
         return this.createResult(true, undefined, Date.now() - startTime);
       }
 
+      // Deduplicate tool calls (Gemini/OpenRouter can emit identical calls)
+      const dedupedToolCalls = deduplicateToolCalls(response.toolCalls);
+      if (dedupedToolCalls.length < response.toolCalls.length) {
+        log.warn('Removed duplicate tool calls', {
+          original: response.toolCalls.length,
+          deduped: dedupedToolCalls.length,
+        });
+      }
+
       // Execute tool calls (with parallel optimization)
       const resultMap = new Map<string, { toolCall: ToolCall; result: ToolResult }>();
       const toolTimings: Array<{ tool: string; mode: string; startMs: number; endMs: number; durationMs: number; success: boolean }> = [];
 
-      if (config.parallelTools && response.toolCalls.length > 1) {
+      if (config.parallelTools && dedupedToolCalls.length > 1) {
         // Partition into parallel-safe and sequential groups
-        const { parallel, sequential } = partitionToolCalls(response.toolCalls);
+        const { parallel, sequential } = partitionToolCalls(dedupedToolCalls);
         const partitionStartMs = Date.now();
 
         log.info('Tool execution partitioned', {
@@ -988,7 +1043,7 @@ export class ConversationEngine {
 
       } else {
         // Single tool call or parallel disabled: sequential execution
-        for (const tc of response.toolCalls) {
+        for (const tc of dedupedToolCalls) {
           await this.events.emit('conversation:tool-call', { toolCall: tc });
           const startMs = Date.now();
           log.debug(`EXECUTING TOOL: ${tc.name}`, { params: tc.params });
@@ -1007,7 +1062,7 @@ export class ConversationEngine {
         if (entry) {
           this.history.push({
             role: 'tool',
-            content: this.formatToolResult(entry.result),
+            content: this.truncateToolResult(this.formatToolResult(entry.result), this.lastConfig?.resultMaxChars ?? 100_000),
             toolCallId: tc.id,
             toolName: tc.name,
           });
@@ -1477,7 +1532,7 @@ export class ConversationEngine {
     // Format combined results
     const combinedParts: string[] = [`[BATCH] Executed ${results.length} tool(s):`];
     for (const { tool, result } of results) {
-      const formatted = this.formatToolResult(result);
+      const formatted = this.truncateToolResult(this.formatToolResult(result), this.lastConfig?.resultMaxChars ?? 100_000);
       combinedParts.push(`\n--- ${tool} ---`);
       combinedParts.push(formatted);
     }
@@ -1797,6 +1852,24 @@ export class ConversationEngine {
     }
 
     return result.error ?? 'Tool execution failed';
+  }
+
+  /**
+   * Truncate a formatted tool result if it exceeds the configured max chars.
+   * Uses 70/30 head/tail strategy to preserve beginning and end context.
+   */
+  private truncateToolResult(content: string, maxChars: number): string {
+    if (content.length <= maxChars) {
+      return content;
+    }
+
+    const headSize = Math.floor(maxChars * 0.7);
+    const tailSize = Math.min(4000, maxChars - headSize);
+    const head = content.slice(0, headSize);
+    const tail = content.slice(-tailSize);
+    const omitted = content.length - headSize - tailSize;
+
+    return `${head}\n\n[... ${omitted} chars omitted (${content.length} total) ...]\n\n${tail}`;
   }
 
   /**

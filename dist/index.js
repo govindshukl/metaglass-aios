@@ -1152,21 +1152,137 @@ function toolRequiresConfirmation(toolName) {
 function toolAllowsParallel(toolName) {
   return getToolMetadata(toolName).allowsParallelExecution;
 }
+var MAX_PARALLEL_BATCH = 8;
+var PATH_SCOPED_TOOLS = {
+  vault_read_note: "note_id",
+  vault_create_note: "title",
+  vault_update_note: "note_id",
+  vault_delete_note: "note_id",
+  vault_set_frontmatter: "note_id",
+  vault_insert_content: "note_id",
+  vault_find_replace: "note_id",
+  Read: "file_path",
+  Glob: "pattern",
+  Grep: "pattern"
+};
+function pathsOverlap(a, b) {
+  if (!a || !b) return false;
+  const na = a.replace(/\\/g, "/");
+  const nb = b.replace(/\\/g, "/");
+  return na === nb || na.startsWith(nb + "/") || nb.startsWith(na + "/");
+}
+function extractPath(toolName, args) {
+  const paramName = PATH_SCOPED_TOOLS[toolName];
+  if (!paramName) return void 0;
+  const value = args[paramName];
+  return typeof value === "string" ? value : void 0;
+}
 function partitionToolCalls(toolCalls) {
   const parallel = [];
   const sequential = [];
+  const parallelPaths = [];
   for (const tc of toolCalls) {
-    if (toolAllowsParallel(tc.name)) {
-      parallel.push(tc);
-    } else {
+    if (!toolAllowsParallel(tc.name)) {
       sequential.push(tc);
+      continue;
     }
+    const path = extractPath(tc.name, tc.arguments ?? {});
+    if (path) {
+      const hasOverlap = parallelPaths.some((p) => pathsOverlap(path, p.path));
+      if (hasOverlap) {
+        sequential.push(tc);
+        continue;
+      }
+      parallelPaths.push({ call: tc, path });
+    }
+    if (parallel.length >= MAX_PARALLEL_BATCH) {
+      sequential.push(tc);
+      continue;
+    }
+    parallel.push(tc);
   }
   return { parallel, sequential };
 }
+function deduplicateToolCalls(toolCalls) {
+  const seen = /* @__PURE__ */ new Set();
+  const result = [];
+  for (const tc of toolCalls) {
+    const key = `${tc.name}:${JSON.stringify(tc.arguments ?? {})}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(tc);
+  }
+  return result;
+}
+
+// src/kernel/MessageRepair.ts
+var log4 = createLogger("MessageRepair");
+function repairToolMessages(messages) {
+  const result = [];
+  let repairCount = 0;
+  const toolResultIds = /* @__PURE__ */ new Set();
+  for (const msg of messages) {
+    if (msg.role === "tool" && msg.toolCallId) {
+      toolResultIds.add(msg.toolCallId);
+    }
+  }
+  const toolCallIds = /* @__PURE__ */ new Set();
+  for (const msg of messages) {
+    if (msg.role === "assistant" && msg.toolCalls) {
+      for (const tc of msg.toolCalls) {
+        toolCallIds.add(tc.id);
+      }
+    }
+  }
+  for (const msg of messages) {
+    if (msg.role === "assistant" && msg.toolCalls) {
+      result.push(msg);
+      for (const tc of msg.toolCalls) {
+        if (!toolResultIds.has(tc.id)) {
+          result.push({
+            role: "tool",
+            content: "[Tool result unavailable \u2014 execution was interrupted]",
+            toolCallId: tc.id,
+            toolName: tc.name
+          });
+          repairCount++;
+          log4.warn("Injected synthetic tool result for orphaned call", {
+            toolCallId: tc.id,
+            toolName: tc.name
+          });
+        }
+      }
+      continue;
+    }
+    if (msg.role === "tool" && msg.toolCallId && !toolCallIds.has(msg.toolCallId)) {
+      result.push({
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: msg.toolCallId,
+          name: msg.toolName ?? "unknown_tool"
+        }]
+      });
+      result.push(msg);
+      repairCount++;
+      log4.warn("Wrapped orphan tool result in synthetic assistant message", {
+        toolCallId: msg.toolCallId,
+        toolName: msg.toolName
+      });
+      continue;
+    }
+    result.push(msg);
+  }
+  if (repairCount > 0) {
+    log4.info("Repaired tool message history", { repairs: repairCount });
+  }
+  return result;
+}
 
 // src/kernel/ConversationEngine.ts
-var log4 = createLogger("ConversationEngine");
+var log5 = createLogger("ConversationEngine");
 var DEFAULT_CONFIG4 = {
   maxTurns: 50,
   timeoutMs: 6e5,
@@ -1203,7 +1319,9 @@ var ACTIVE_TOOLS = /* @__PURE__ */ new Set([
   "Bash",
   // Web
   "web_search",
-  "web_fetch"
+  "web_fetch",
+  // Skills (on-demand skill loading from catalog)
+  "skill_load"
 ]);
 var SUBAGENT_TOOL_DEFINITIONS = [
   {
@@ -1339,9 +1457,9 @@ var ConversationEngine = class _ConversationEngine {
    * Execute a conversation with the given prompt
    */
   async execute(prompt, config) {
-    log4.info("Execute called", { promptLength: prompt.length, hasConfig: !!config });
+    log5.info("Execute called", { promptLength: prompt.length, hasConfig: !!config });
     if (this.isRunning()) {
-      log4.warn("Conversation already running");
+      log5.warn("Conversation already running");
       return this.createResult(false, "Conversation already running", 0);
     }
     const cfg = {
@@ -1354,9 +1472,11 @@ var ConversationEngine = class _ConversationEngine {
       // These don't have defaults in DEFAULT_CONFIG
       systemPrompt: config?.systemPrompt,
       signal: config?.signal,
-      compression: config?.compression
+      compression: config?.compression,
+      visibleTools: config?.visibleTools,
+      resultMaxChars: config?.resultMaxChars ?? 1e5
     };
-    log4.info("Merged config", { maxTurns: cfg.maxTurns, timeoutMs: cfg.timeoutMs, requireTodoWrite: cfg.requireTodoWrite });
+    log5.info("Merged config", { maxTurns: cfg.maxTurns, timeoutMs: cfg.timeoutMs, requireTodoWrite: cfg.requireTodoWrite });
     this.lastConfig = cfg;
     this.history = [];
     this.status = "running";
@@ -1376,9 +1496,9 @@ var ConversationEngine = class _ConversationEngine {
     if (cfg.systemPrompt) {
       this.baseSystemPrompt = cfg.systemPrompt;
       this.history.push({ role: "system", content: cfg.systemPrompt });
-      log4.debug("Added system prompt", { length: cfg.systemPrompt.length });
+      log5.debug("Added system prompt", { length: cfg.systemPrompt.length });
     } else {
-      log4.warn("No system prompt provided - LLM may not use tools effectively");
+      log5.warn("No system prompt provided - LLM may not use tools effectively");
     }
     this.history.push({ role: "user", content: prompt });
     this.originalGoal = prompt;
@@ -1462,7 +1582,7 @@ var ConversationEngine = class _ConversationEngine {
    * Main conversation loop
    */
   async runLoop(config, startTime) {
-    log4.info("Starting conversation loop", { maxTurns: config.maxTurns, timeoutMs: config.timeoutMs, startTurn: this.currentTurn });
+    log5.info("Starting conversation loop", { maxTurns: config.maxTurns, timeoutMs: config.timeoutMs, startTurn: this.currentTurn });
     while (this.currentTurn < config.maxTurns) {
       if (this.abortController?.signal.aborted || config.signal?.aborted) {
         this.debugHarness?.trace("termination", "cancelled", {
@@ -1478,7 +1598,7 @@ var ConversationEngine = class _ConversationEngine {
         return this.createResult(false, "Conversation timeout", Date.now() - startTime, "failed");
       }
       this.currentTurn++;
-      log4.info("Turn", { turn: this.currentTurn, historyLength: this.history.length });
+      log5.info("Turn", { turn: this.currentTurn, historyLength: this.history.length });
       this.debugHarness?.setTurn(this.currentTurn);
       this.debugHarness?.trace("turn-start", "turn-begin", {
         turn: this.currentTurn,
@@ -1514,17 +1634,25 @@ ${activeTodos}`);
         const remainingTime = config.timeoutMs - (Date.now() - startTime);
         if (remainingTime <= 0) {
           this.status = "failed";
-          log4.warn("Timeout before LLM call", { turn: this.currentTurn });
+          log5.warn("Timeout before LLM call", { turn: this.currentTurn });
           return this.createResult(false, "Conversation timeout", Date.now() - startTime, "failed");
         }
-        const toolsList = this.tools.list().filter((t) => ACTIVE_TOOLS.has(t.name));
+        const visibleSet = config?.visibleTools ? new Set(config.visibleTools) : ACTIVE_TOOLS;
+        const toolsList = this.tools.list().filter((t) => visibleSet.has(t.name));
+        log5.info("Tool visibility filter", {
+          usingPolicy: !!config?.visibleTools,
+          policyToolCount: config?.visibleTools?.length,
+          registeredToolCount: this.tools.list().length,
+          visibleToolCount: toolsList.length,
+          visibleToolNames: toolsList.map((t) => t.name)
+        });
         if (this.taskSpawner) {
           toolsList.push(...SUBAGENT_TOOL_DEFINITIONS);
         }
-        log4.debug("=".repeat(80));
-        log4.debug(`TURN ${this.currentTurn} - SENDING TO LLM`);
-        log4.debug("=".repeat(80));
-        log4.debug("Message History:", {
+        log5.debug("=".repeat(80));
+        log5.debug(`TURN ${this.currentTurn} - SENDING TO LLM`);
+        log5.debug("=".repeat(80));
+        log5.debug("Message History:", {
           messageCount: this.history.length,
           messages: this.history.map((msg, idx) => ({
             index: idx,
@@ -1536,9 +1664,9 @@ ${activeTodos}`);
             toolNames: msg.toolCalls?.map((tc) => tc.name)
           }))
         });
-        log4.debug("Available Tools:", { count: toolsList.length, tools: toolsList.map((t) => t.name) });
-        log4.debug("Full Prompt:", { history: this.history });
-        log4.debug("=".repeat(80));
+        log5.debug("Available Tools:", { count: toolsList.length, tools: toolsList.map((t) => t.name) });
+        log5.debug("Full Prompt:", { history: this.history });
+        log5.debug("=".repeat(80));
         let messagesToSend = this.history;
         if (config.compression) {
           this.contextCompressor.updateConfig(config.compression);
@@ -1549,12 +1677,13 @@ ${activeTodos}`);
         );
         if (compressionResult.wasCompressed) {
           messagesToSend = compressionResult.messages;
-          log4.info("Context compressed before LLM call", {
+          log5.info("Context compressed before LLM call", {
             originalTokens: compressionResult.originalTokens,
             compressedTokens: compressionResult.compressedTokens,
             summarizedTurns: compressionResult.summarizedTurns
           });
         }
+        messagesToSend = repairToolMessages(messagesToSend);
         this.debugHarness?.trace("llm-request", "sending-to-llm", {
           turn: this.currentTurn,
           messageCount: messagesToSend.length,
@@ -1593,18 +1722,18 @@ ${activeTodos}`);
           }, remainingTime);
         });
         response = await Promise.race([llmPromise, timeoutPromise]);
-        log4.debug("=".repeat(80));
-        log4.debug(`TURN ${this.currentTurn} - RECEIVED FROM LLM`);
-        log4.debug("=".repeat(80));
-        log4.debug("Response Summary:", {
+        log5.debug("=".repeat(80));
+        log5.debug(`TURN ${this.currentTurn} - RECEIVED FROM LLM`);
+        log5.debug("=".repeat(80));
+        log5.debug("Response Summary:", {
           contentLength: response.content?.length ?? 0,
           hasToolCalls: !!response.toolCalls,
           toolCallCount: response.toolCalls?.length ?? 0,
           finishReason: response.finishReason
         });
-        log4.debug("Content:", { content: response.content });
+        log5.debug("Content:", { content: response.content });
         if (response.toolCalls && response.toolCalls.length > 0) {
-          log4.debug("Tool Calls:", {
+          log5.debug("Tool Calls:", {
             toolCalls: response.toolCalls.map((tc) => ({
               id: tc.id,
               name: tc.name,
@@ -1612,8 +1741,8 @@ ${activeTodos}`);
             }))
           });
         }
-        log4.debug("Full Response:", { response });
-        log4.debug("=".repeat(80));
+        log5.debug("Full Response:", { response });
+        log5.debug("=".repeat(80));
         this.debugHarness?.trace("llm-response", "received-from-llm", {
           turn: this.currentTurn,
           contentLength: response.content?.length ?? 0,
@@ -1631,7 +1760,7 @@ ${activeTodos}`);
           usage: response.usage
         });
       } catch (error) {
-        log4.error("LLM call failed", { turn: this.currentTurn, error: error.message, name: error.name });
+        log5.error("LLM call failed", { turn: this.currentTurn, error: error.message, name: error.name });
         this.debugHarness?.trace("error", "llm-call-failed", {
           turn: this.currentTurn,
           errorName: error.name,
@@ -1660,20 +1789,20 @@ ${activeTodos}`);
         );
         if (hasTodoWrite) {
           this.hasPlan = true;
-          log4.info("TodoWrite called - plan established", { turn: this.currentTurn });
+          log5.info("TodoWrite called - plan established", { turn: this.currentTurn });
           this.debugHarness?.trace("todowrite-gate", "plan-established", {
             turn: this.currentTurn
           });
         } else if (response.toolCalls && response.toolCalls.length > 0) {
           const exemptTools = filterExemptTools(response.toolCalls);
           const actionTools = filterActionTools(response.toolCalls);
-          log4.debug("Tool exemption check", {
+          log5.debug("Tool exemption check", {
             turn: this.currentTurn,
             exemptTools: exemptTools.map((tc) => tc.name),
             actionTools: actionTools.map((tc) => tc.name)
           });
           if (actionTools.length === 0 && exemptTools.length > 0) {
-            log4.info("Allowing exempt tools without TodoWrite", {
+            log5.info("Allowing exempt tools without TodoWrite", {
               turn: this.currentTurn,
               tools: exemptTools.map((tc) => tc.name)
             });
@@ -1684,7 +1813,7 @@ ${activeTodos}`);
             });
           } else if (actionTools.length > 0) {
             this.planEnforcementAttempts++;
-            log4.warn("Agent using action tools without TodoWrite plan", {
+            log5.warn("Agent using action tools without TodoWrite plan", {
               turn: this.currentTurn,
               attempt: this.planEnforcementAttempts,
               maxAttempts: this.MAX_PLAN_ENFORCEMENT_ATTEMPTS,
@@ -1713,7 +1842,7 @@ ${activeTodos}`);
               await this.events.emit("conversation:tool-result", { toolCall, result });
               this.history.push({
                 role: "tool",
-                content: this.formatToolResult(result),
+                content: this.truncateToolResult(this.formatToolResult(result), this.lastConfig?.resultMaxChars ?? 1e5),
                 toolCallId: toolCall.id,
                 toolName: toolCall.name
               });
@@ -1727,18 +1856,30 @@ ${activeTodos}`);
         }
       }
       if (!this.hasPlan && this.currentTurn > this.MAX_PLAN_ENFORCEMENT_ATTEMPTS) {
-        log4.warn("Agent proceeding without TodoWrite plan after max enforcement attempts");
+        log5.warn("Agent proceeding without TodoWrite plan after max enforcement attempts");
       }
       if (!response.toolCalls || response.toolCalls.length === 0) {
         if (response.finishReason === "tool_calls") {
-          log4.warn("All tool calls were filtered out \u2014 continuing loop", { turn: this.currentTurn });
-          this.debugHarness?.trace("turn-end", "tools-filtered-retry", {
+          log5.warn("All tool calls were filtered out \u2014 completing with policy message", { turn: this.currentTurn });
+          const lastMsg = this.history[this.history.length - 1];
+          if (lastMsg?.role === "assistant") {
+            this.history.pop();
+          }
+          const policyMessage = response.content ? `${response.content}
+
+(Note: I attempted to use tools that are not available in this session's tool profile. The requested action cannot be performed with the current permissions.)` : "I attempted to use tools that are not available in this session's tool profile. The requested action cannot be performed with the current permissions. Please adjust the tool profile in settings if you need write access.";
+          this.history.push({
+            role: "assistant",
+            content: policyMessage
+          });
+          this.debugHarness?.trace("turn-end", "tools-filtered-policy-stop", {
             turn: this.currentTurn,
             finishReason: response.finishReason
           });
-          continue;
+          this.status = "completed";
+          return this.createResult(true, void 0, Date.now() - startTime, "completed");
         }
-        log4.info("Conversation complete", { turn: this.currentTurn, finishReason: response.finishReason });
+        log5.info("Conversation complete", { turn: this.currentTurn, finishReason: response.finishReason });
         this.debugHarness?.trace("completion", "conversation-done", {
           turn: this.currentTurn,
           finishReason: response.finishReason,
@@ -1755,12 +1896,19 @@ ${activeTodos}`);
         });
         return this.createResult(true, void 0, Date.now() - startTime);
       }
+      const dedupedToolCalls = deduplicateToolCalls(response.toolCalls);
+      if (dedupedToolCalls.length < response.toolCalls.length) {
+        log5.warn("Removed duplicate tool calls", {
+          original: response.toolCalls.length,
+          deduped: dedupedToolCalls.length
+        });
+      }
       const resultMap = /* @__PURE__ */ new Map();
       const toolTimings = [];
-      if (config.parallelTools && response.toolCalls.length > 1) {
-        const { parallel, sequential } = partitionToolCalls(response.toolCalls);
+      if (config.parallelTools && dedupedToolCalls.length > 1) {
+        const { parallel, sequential } = partitionToolCalls(dedupedToolCalls);
         const partitionStartMs = Date.now();
-        log4.info("Tool execution partitioned", {
+        log5.info("Tool execution partitioned", {
           turn: this.currentTurn,
           total: response.toolCalls.length,
           parallelCount: parallel.length,
@@ -1781,7 +1929,7 @@ ${activeTodos}`);
           const settled = await Promise.allSettled(
             parallel.map(async (tc) => {
               const startMs = Date.now();
-              log4.debug(`EXECUTING TOOL (parallel): ${tc.name}`, { params: tc.params });
+              log5.debug(`EXECUTING TOOL (parallel): ${tc.name}`, { params: tc.params });
               const result = await this.executeTool(tc);
               const endMs = Date.now();
               toolTimings.push({ tool: tc.name, mode: "parallel", startMs, endMs, durationMs: endMs - startMs, success: result.success });
@@ -1789,7 +1937,7 @@ ${activeTodos}`);
             })
           );
           const batchEndMs = Date.now();
-          log4.info("Parallel batch completed", {
+          log5.info("Parallel batch completed", {
             turn: this.currentTurn,
             wallClockMs: batchEndMs - batchStartMs,
             tools: parallel.map((tc) => tc.name),
@@ -1805,14 +1953,14 @@ ${activeTodos}`);
               resultMap.set(toolCall.id, { toolCall, result });
               await this.processToolResult(toolCall, result);
             } else {
-              log4.error("Unexpected parallel tool rejection", { reason: outcome.reason });
+              log5.error("Unexpected parallel tool rejection", { reason: outcome.reason });
             }
           }
         }
         for (const tc of sequential) {
           await this.events.emit("conversation:tool-call", { toolCall: tc });
           const startMs = Date.now();
-          log4.debug(`EXECUTING TOOL (sequential): ${tc.name}`, { params: tc.params });
+          log5.debug(`EXECUTING TOOL (sequential): ${tc.name}`, { params: tc.params });
           const result = await this.executeTool(tc);
           const endMs = Date.now();
           toolTimings.push({ tool: tc.name, mode: "sequential", startMs, endMs, durationMs: endMs - startMs, success: result.success });
@@ -1821,7 +1969,7 @@ ${activeTodos}`);
         }
         const totalMs = Date.now() - partitionStartMs;
         const sequentialSum = toolTimings.reduce((acc, t) => acc + t.durationMs, 0);
-        log4.info("Turn tool execution summary", {
+        log5.info("Turn tool execution summary", {
           turn: this.currentTurn,
           wallClockMs: totalMs,
           sumOfIndividualMs: sequentialSum,
@@ -1842,14 +1990,14 @@ ${activeTodos}`);
           timings: toolTimings
         });
       } else {
-        for (const tc of response.toolCalls) {
+        for (const tc of dedupedToolCalls) {
           await this.events.emit("conversation:tool-call", { toolCall: tc });
           const startMs = Date.now();
-          log4.debug(`EXECUTING TOOL: ${tc.name}`, { params: tc.params });
+          log5.debug(`EXECUTING TOOL: ${tc.name}`, { params: tc.params });
           const result = await this.executeTool(tc);
           const endMs = Date.now();
           const durationMs = endMs - startMs;
-          log4.info(`Tool executed (single)`, { turn: this.currentTurn, tool: tc.name, durationMs, success: result.success });
+          log5.info(`Tool executed (single)`, { turn: this.currentTurn, tool: tc.name, durationMs, success: result.success });
           resultMap.set(tc.id, { toolCall: tc, result });
           await this.processToolResult(tc, result);
         }
@@ -1859,7 +2007,7 @@ ${activeTodos}`);
         if (entry) {
           this.history.push({
             role: "tool",
-            content: this.formatToolResult(entry.result),
+            content: this.truncateToolResult(this.formatToolResult(entry.result), this.lastConfig?.resultMaxChars ?? 1e5),
             toolCallId: tc.id,
             toolName: tc.name
           });
@@ -1874,7 +2022,7 @@ ${activeTodos}`);
       }
       const loopAction = this.detectLoop(response.toolCalls ?? []);
       if (loopAction === "force-stop") {
-        log4.warn("Loop detected \u2014 force-stopping conversation", {
+        log5.warn("Loop detected \u2014 force-stopping conversation", {
           turn: this.currentTurn,
           staleTodoTurns: this.staleTodoTurns,
           recentSignatures: this.recentToolSignatures
@@ -1893,7 +2041,7 @@ ${activeTodos}`);
         );
       }
       if (loopAction === "nudge") {
-        log4.info("Loop detected \u2014 injecting nudge", {
+        log5.info("Loop detected \u2014 injecting nudge", {
           turn: this.currentTurn,
           staleTodoTurns: this.staleTodoTurns
         });
@@ -1929,7 +2077,7 @@ ${activeTodos}`);
       durationMs: Date.now() - startTime
     });
     this.status = "timeout";
-    log4.warn("Max turns reached", { maxTurns: config.maxTurns, actualTurns: this.currentTurn });
+    log5.warn("Max turns reached", { maxTurns: config.maxTurns, actualTurns: this.currentTurn });
     await this.events.emit(
       "conversation:timeout",
       { conversationId: this.conversationId }
@@ -1957,7 +2105,7 @@ ${activeTodos}`);
     if (this.recentToolSignatures.length >= _ConversationEngine.LOOP_DETECTION_WINDOW) {
       const allSame = this.recentToolSignatures.every((s) => s === this.recentToolSignatures[0]);
       if (allSame) {
-        log4.warn("Exact tool repetition detected", {
+        log5.warn("Exact tool repetition detected", {
           window: _ConversationEngine.LOOP_DETECTION_WINDOW,
           signature: this.recentToolSignatures[0]?.substring(0, 200)
         });
@@ -1968,7 +2116,7 @@ ${activeTodos}`);
       const toolNames = this.recentToolSignatures.map((s) => s.split(":")[0]);
       const allSameToolName = toolNames.every((n) => n === toolNames[0]);
       if (allSameToolName && this.staleTodoTurns >= _ConversationEngine.STALE_TODO_THRESHOLD) {
-        log4.warn("Same tool type with stale todos", {
+        log5.warn("Same tool type with stale todos", {
           toolName: toolNames[0],
           staleTurns: this.staleTodoTurns
         });
@@ -1990,7 +2138,7 @@ ${activeTodos}`);
    * Execute a single tool call
    */
   async executeTool(toolCall) {
-    log4.info("Tool", { name: toolCall.name });
+    log5.info("Tool", { name: toolCall.name });
     if (toolCall.name === "AskUserQuestion") {
       this.debugHarness?.trace("tool-special", "ask-user-question", {
         turn: this.currentTurn,
@@ -2055,7 +2203,7 @@ ${activeTodos}`);
       {
         signal: this.abortController?.signal,
         onRetry: (attempt, error, delayMs) => {
-          log4.info(`Retrying tool ${toolCall.name}`, {
+          log5.info(`Retrying tool ${toolCall.name}`, {
             attempt,
             error: error.message,
             delayMs
@@ -2145,7 +2293,7 @@ ${activeTodos}`);
         observation: 'Error: batch_tools "calls" array is empty. Provide at least one tool call.'
       };
     }
-    log4.info("Executing batch_tools", { callCount: calls.length, tools: calls.map((c) => c.tool) });
+    log5.info("Executing batch_tools", { callCount: calls.length, tools: calls.map((c) => c.tool) });
     const subToolCalls = calls.map((call, i) => ({
       id: `batch_${call.tool}_${i}_${Date.now()}`,
       name: call.tool,
@@ -2191,7 +2339,7 @@ ${activeTodos}`);
           batchResultMap.set(subToolCall.id, { tool: subToolCall.name, result });
           await this.processToolResult(subToolCall, result);
         } else {
-          log4.error("Unexpected batch parallel tool rejection", { reason: outcome.reason });
+          log5.error("Unexpected batch parallel tool rejection", { reason: outcome.reason });
         }
       }
     } else {
@@ -2233,7 +2381,7 @@ ${activeTodos}`);
     });
     const combinedParts = [`[BATCH] Executed ${results.length} tool(s):`];
     for (const { tool: tool2, result } of results) {
-      const formatted = this.formatToolResult(result);
+      const formatted = this.truncateToolResult(this.formatToolResult(result), this.lastConfig?.resultMaxChars ?? 1e5);
       combinedParts.push(`
 --- ${tool2} ---`);
       combinedParts.push(formatted);
@@ -2266,7 +2414,7 @@ ${activeTodos}`);
       runInBackground: Boolean(params.runInBackground)
     };
     try {
-      log4.info("Spawning sub-agent", {
+      log5.info("Spawning sub-agent", {
         type: taskParams.subagentType,
         model: taskParams.model,
         background: taskParams.runInBackground,
@@ -2288,7 +2436,7 @@ ${typeof result.data === "string" ? result.data : JSON.stringify(result.data, nu
       };
     } catch (e) {
       const errorMsg = e instanceof Error ? e.message : String(e);
-      log4.error("spawn_task failed", { error: errorMsg });
+      log5.error("spawn_task failed", { error: errorMsg });
       return {
         success: false,
         error: errorMsg,
@@ -2494,6 +2642,25 @@ ${key} (${arr.length} items):`);
     return result.error ?? "Tool execution failed";
   }
   /**
+   * Truncate a formatted tool result if it exceeds the configured max chars.
+   * Uses 70/30 head/tail strategy to preserve beginning and end context.
+   */
+  truncateToolResult(content, maxChars) {
+    if (content.length <= maxChars) {
+      return content;
+    }
+    const headSize = Math.floor(maxChars * 0.7);
+    const tailSize = Math.min(4e3, maxChars - headSize);
+    const head = content.slice(0, headSize);
+    const tail = content.slice(-tailSize);
+    const omitted = content.length - headSize - tailSize;
+    return `${head}
+
+[... ${omitted} chars omitted (${content.length} total) ...]
+
+${tail}`;
+  }
+  /**
    * Create a conversation result
    */
   createResult(success, error, durationMs, status) {
@@ -2540,7 +2707,7 @@ ${key} (${arr.length} items):`);
    */
   async checkpoint() {
     if (!this.conversationId) {
-      log4.warn("Cannot checkpoint: no active conversation");
+      log5.warn("Cannot checkpoint: no active conversation");
       return;
     }
     const snapshot = this.store.createSnapshot(
@@ -2558,7 +2725,7 @@ ${key} (${arr.length} items):`);
       }
     );
     await this.store.save(snapshot);
-    log4.debug("Checkpoint saved", { id: this.conversationId, turn: this.currentTurn });
+    log5.debug("Checkpoint saved", { id: this.conversationId, turn: this.currentTurn });
     await this.events.emit("conversation:checkpoint", {
       conversationId: this.conversationId,
       turn: this.currentTurn
@@ -2572,14 +2739,14 @@ ${key} (${arr.length} items):`);
    * @returns ConversationResult from continued execution
    */
   async resume(conversationId, config) {
-    log4.info("Resuming conversation", { id: conversationId });
+    log5.info("Resuming conversation", { id: conversationId });
     const snapshot = await this.store.load(conversationId);
     if (!snapshot) {
-      log4.error("Cannot resume: conversation not found", { id: conversationId });
+      log5.error("Cannot resume: conversation not found", { id: conversationId });
       return this.createResult(false, `Conversation ${conversationId} not found`, 0, "failed");
     }
     if (this.isRunning()) {
-      log4.warn("Cannot resume: conversation already running");
+      log5.warn("Cannot resume: conversation already running");
       return this.createResult(false, "Conversation already running", 0);
     }
     this.conversationId = snapshot.id;
@@ -2646,7 +2813,7 @@ ${key} (${arr.length} items):`);
    */
   setAutoCheckpoint(enabled) {
     this.autoCheckpoint = enabled;
-    log4.debug("Auto-checkpoint", { enabled });
+    log5.debug("Auto-checkpoint", { enabled });
   }
   /**
    * Set a custom conversation store
@@ -2657,7 +2824,7 @@ ${key} (${arr.length} items):`);
 };
 
 // src/kernel/TodoManager.ts
-var log5 = createLogger("TodoManager");
+var log6 = createLogger("TodoManager");
 var VALID_STATUSES = ["pending", "in_progress", "completed"];
 function validateTodo(todo) {
   if (!todo.content || todo.content.trim() === "") {
@@ -2678,42 +2845,42 @@ var TodoManager = class {
   isProcessingEvent = false;
   constructor(events) {
     this.events = events;
-    log5.info("TodoManager constructor - subscribing to todo:updated events");
+    log6.info("TodoManager constructor - subscribing to todo:updated events");
     this.events.on("todo:updated", (payload) => {
-      log5.info("TodoManager received todo:updated event", {
+      log6.info("TodoManager received todo:updated event", {
         isProcessingEvent: this.isProcessingEvent,
         payload
       });
       if (this.isProcessingEvent) {
-        log5.debug("Ignoring event - self-emitted");
+        log6.debug("Ignoring event - self-emitted");
         return;
       }
       const todos = payload.todos;
       this.handleExternalUpdate(todos);
     });
-    log5.info("TodoManager constructor complete - subscription active");
+    log6.info("TodoManager constructor complete - subscription active");
   }
   /**
    * Handle external todo updates (from ConversationEngine)
    * Updates internal state and notifies subscribers without re-emitting events
    */
   handleExternalUpdate(todos) {
-    log5.info("handleExternalUpdate called", { todoCount: todos.length, todos });
+    log6.info("handleExternalUpdate called", { todoCount: todos.length, todos });
     for (const todo of todos) {
       const error = validateTodo(todo);
       if (error) {
-        log5.warn("Invalid todo from external update", { error, todo });
+        log6.warn("Invalid todo from external update", { error, todo });
         return;
       }
     }
     const inProgress = todos.filter((t) => t.status === "in_progress");
     if (inProgress.length > 1) {
-      log5.warn("External update has multiple in_progress tasks");
+      log6.warn("External update has multiple in_progress tasks");
       return;
     }
     this.todos = todos.map((t) => ({ ...t }));
-    log5.info("Internal todos updated", { todoCount: this.todos.length });
-    log5.info("Notifying subscribers", { subscriberCount: this.subscribers.size });
+    log6.info("Internal todos updated", { todoCount: this.todos.length });
+    log6.info("Notifying subscribers", { subscriberCount: this.subscribers.size });
     this.notifySubscribers();
   }
   // ===========================================================================
@@ -2866,10 +3033,10 @@ var TodoManager = class {
    */
   subscribe(callback) {
     this.subscribers.add(callback);
-    log5.info("Subscriber added to TodoManager", { subscriberCount: this.subscribers.size });
+    log6.info("Subscriber added to TodoManager", { subscriberCount: this.subscribers.size });
     return () => {
       this.subscribers.delete(callback);
-      log5.info("Subscriber removed from TodoManager", { subscriberCount: this.subscribers.size });
+      log6.info("Subscriber removed from TodoManager", { subscriberCount: this.subscribers.size });
     };
   }
   // ===========================================================================
@@ -3425,20 +3592,20 @@ var VerificationEngine = class {
 };
 
 // src/fs.ts
-var log6 = createLogger("Filesystem");
+var log7 = createLogger("Filesystem");
 var noopFilesystem = {
   async writeTextFile(path, _content) {
-    log6.debug("writeTextFile (no-op)", { path });
+    log7.debug("writeTextFile (no-op)", { path });
   },
   async readTextFile(path) {
-    log6.debug("readTextFile (no-op)", { path });
+    log7.debug("readTextFile (no-op)", { path });
     return "";
   },
   async mkdir(path, _options) {
-    log6.debug("mkdir (no-op)", { path });
+    log7.debug("mkdir (no-op)", { path });
   },
   async exists(path) {
-    log6.debug("exists (no-op)", { path });
+    log7.debug("exists (no-op)", { path });
     return false;
   }
 };
@@ -3467,7 +3634,7 @@ function createMemoryFilesystem() {
 var currentFilesystem = noopFilesystem;
 function setFilesystem(fs) {
   currentFilesystem = fs;
-  log6.info("Filesystem set");
+  log7.info("Filesystem set");
 }
 function getFilesystem() {
   return currentFilesystem;
@@ -3987,16 +4154,16 @@ function initDebugFlag() {
   }
 }
 initDebugFlag();
-var log7 = createLogger("VercelAILLMProvider");
+var log8 = createLogger("VercelAILLMProvider");
 var modelProvider = null;
 var toolRegistryProvider = null;
 function setModelProvider(provider) {
   modelProvider = provider;
-  log7.info("Model provider set");
+  log8.info("Model provider set");
 }
 function setToolRegistryProvider(provider) {
   toolRegistryProvider = provider;
-  log7.info("Tool registry provider set");
+  log8.info("Tool registry provider set");
 }
 function toCoreMess(messages) {
   return messages.map((msg) => {
@@ -4041,7 +4208,7 @@ function toCoreMess(messages) {
           ]
         };
       default:
-        log7.warn("Unknown message role, treating as user", { role: msg.role });
+        log8.warn("Unknown message role, treating as user", { role: msg.role });
         return { role: "user", content: msg.content };
     }
   });
@@ -4053,7 +4220,7 @@ function getToolsFromRegistry(toolNames) {
   const registryTools = toolRegistryProvider.getToolsForAI({
     ids: toolNames
   });
-  log7.info("Got tools from ToolRegistry", {
+  log8.info("Got tools from ToolRegistry", {
     count: Object.keys(registryTools).length,
     names: Object.keys(registryTools)
   });
@@ -4072,9 +4239,9 @@ function toCoreTools(tools) {
       inputSchema
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     });
-    log7.debug("Registered fallback tool", { name: toolDef.name });
+    log8.debug("Registered fallback tool", { name: toolDef.name });
   }
-  log7.info("Converted tools for LLM (fallback)", { count: tools.length });
+  log8.info("Converted tools for LLM (fallback)", { count: tools.length });
   return coreTools;
 }
 function extractToolCalls(toolCalls) {
@@ -4128,7 +4295,7 @@ var VercelAILLMProvider = class _VercelAILLMProvider {
       const toolNames = options.tools.map((t) => t.name);
       tools = getToolsFromRegistry(toolNames);
       if (Object.keys(tools).length === 0) {
-        log7.warn("No tools found in ToolRegistry, using fallback conversion");
+        log8.warn("No tools found in ToolRegistry, using fallback conversion");
         tools = toCoreTools(options.tools);
       }
     }
@@ -4179,7 +4346,7 @@ var VercelAILLMProvider = class _VercelAILLMProvider {
         }
         return total;
       }, 0);
-      log7.info("Calling generateText", {
+      log8.info("Calling generateText", {
         toolCount: generateOptions.tools ? Object.keys(generateOptions.tools).length : 0,
         messageCount: coreMessages.length,
         contextSizeChars: contextSize,
@@ -4210,10 +4377,10 @@ var VercelAILLMProvider = class _VercelAILLMProvider {
       };
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
-        log7.warn("LLM call aborted", { name: error.name });
+        log8.warn("LLM call aborted", { name: error.name });
         throw error;
       }
-      log7.error("LLM call failed", {
+      log8.error("LLM call failed", {
         message: error instanceof Error ? error.message : String(error),
         name: error instanceof Error ? error.name : "Unknown"
       });
@@ -4333,7 +4500,7 @@ function createDefaultLLMProvider() {
 }
 
 // src/AIOSService.ts
-var log8 = createLogger("AIOSService");
+var log9 = createLogger("AIOSService");
 function createStubLLMProvider() {
   return {
     id: "stub",
@@ -4372,19 +4539,19 @@ function createStubToolProvider() {
 function createStubUserInterface() {
   return {
     ask: async (request) => {
-      log8.warn("ask() called but no UI configured:", request.question);
+      log9.warn("ask() called but no UI configured:", request.question);
       return "No response (stub UI)";
     },
     askMultiple: async (questions) => {
-      log8.warn("askMultiple() called but no UI configured:", questions);
+      log9.warn("askMultiple() called but no UI configured:", questions);
       return {};
     },
     confirm: async (message) => {
-      log8.warn("confirm() called but no UI configured:", message);
+      log9.warn("confirm() called but no UI configured:", message);
       return false;
     },
     notify: (message, type) => {
-      log8.info(`[${type || "info"}]`, message);
+      log9.info(`[${type || "info"}]`, message);
     },
     isPending: () => false,
     cancel: () => {
@@ -4442,7 +4609,7 @@ var currentProviders = {
 };
 function setProviders(providers) {
   currentProviders = { ...currentProviders, ...providers };
-  log8.info("Providers updated");
+  log9.info("Providers updated");
 }
 function getProviders() {
   return currentProviders;
@@ -4458,18 +4625,18 @@ var AIOSService = class {
   // Providers - toolProvider is cached, llmProvider is created fresh each time
   toolProvider;
   constructor(config = {}) {
-    log8.info("AIOSService constructor starting");
+    log9.info("AIOSService constructor starting");
     this.config = config;
     this.providers = { ...currentProviders, ...config.providers };
     if (config.toolPatterns && config.toolPatterns.length > 0 && this.providers.createFilteredToolProvider) {
-      log8.info("Creating filtered tool provider", { patterns: config.toolPatterns });
+      log9.info("Creating filtered tool provider", { patterns: config.toolPatterns });
       this.toolProvider = this.providers.createFilteredToolProvider(config.toolPatterns);
     } else {
       this.toolProvider = this.providers.createToolProvider();
     }
-    log8.info("Getting event emitter");
+    log9.info("Getting event emitter");
     const events = this.providers.getEventEmitter();
-    log8.info("Creating TodoManager");
+    log9.info("Creating TodoManager");
     this.todoManager = new TodoManager(events);
     this.planManager = new PlanManager(events);
     const agentFactory = this.createAgentFactory();
@@ -4477,7 +4644,7 @@ var AIOSService = class {
     if (typeof window !== "undefined" && window.__aiosDebugEnabled) {
       installDebugStub();
     }
-    log8.info("AIOSService constructor complete");
+    log9.info("AIOSService constructor complete");
   }
   // ===========================================================================
   // PUBLIC API
@@ -4517,6 +4684,12 @@ var AIOSService = class {
       if (config.requireTodoWrite !== void 0) {
         mergedConfig.requireTodoWrite = config.requireTodoWrite;
       }
+      if (config.visibleTools !== void 0) {
+        mergedConfig.visibleTools = config.visibleTools;
+      }
+      if (config.resultMaxChars !== void 0) {
+        mergedConfig.resultMaxChars = config.resultMaxChars;
+      }
     }
     if (this.config.requireTodoWrite !== void 0 && mergedConfig.requireTodoWrite === void 0) {
       mergedConfig.requireTodoWrite = this.config.requireTodoWrite;
@@ -4524,7 +4697,7 @@ var AIOSService = class {
     const enableMemoryContext = this.config.enableMemoryContext !== false;
     if (enableMemoryContext && this.providers.getMemoryContext && this.providers.buildEnhancedSystemPrompt) {
       try {
-        log8.info("Fetching memory context for conversation");
+        log9.info("Fetching memory context for conversation");
         const memoryContext = await this.providers.getMemoryContext(
           [{ role: "user", content: prompt }],
           {
@@ -4539,14 +4712,17 @@ var AIOSService = class {
             memoryContext,
             prompt
           );
-          log8.info("Enhanced system prompt built", {
+          log9.info("Enhanced system prompt built", {
             memoryCount: memoryContext.memories.length,
             hasProfile: !!memoryContext.userProfile
           });
         }
       } catch (error) {
-        log8.warn("Failed to build enhanced system prompt", { error });
+        log9.warn("Failed to build enhanced system prompt", { error });
       }
+    }
+    if (config?.systemPromptSuffix && mergedConfig.systemPrompt) {
+      mergedConfig.systemPrompt += config.systemPromptSuffix;
     }
     if (typeof window !== "undefined" && window.__aiosDebugEnabled) {
       installDebugStub();
@@ -4558,7 +4734,7 @@ var AIOSService = class {
       absorbPendingConfig(harness);
       this.conversationEngine.setDebugHarness(harness);
       window.__aiosDebug = harness.getConsoleAPI();
-      log8.info("Debug harness attached", { tracePath: harness.getConsoleAPI().getTracePath() });
+      log9.info("Debug harness attached", { tracePath: harness.getConsoleAPI().getTracePath() });
     }
     const result = await this.conversationEngine.execute(prompt, mergedConfig);
     return result;
@@ -4588,7 +4764,7 @@ var AIOSService = class {
     return this.todoManager.getProgress();
   }
   onTodosChange(callback) {
-    log8.info("onTodosChange called - subscribing to TodoManager");
+    log9.info("onTodosChange called - subscribing to TodoManager");
     return this.todoManager.subscribe(callback);
   }
   // ===========================================================================
@@ -4711,7 +4887,7 @@ var AIOSService = class {
 var defaultInstance = null;
 function getAIOSService(config) {
   if (!defaultInstance) {
-    log8.info("Creating new AIOSService singleton instance");
+    log9.info("Creating new AIOSService singleton instance");
     defaultInstance = new AIOSService(config);
   }
   return defaultInstance;
@@ -4727,17 +4903,17 @@ function resetAIOSService() {
 }
 
 // src/backend.ts
-var log9 = createLogger("Backend");
+var log10 = createLogger("Backend");
 var noopBackend = {
   async invoke(command, args) {
-    log9.debug("Backend invoke (no-op)", { command, args });
+    log10.debug("Backend invoke (no-op)", { command, args });
     return null;
   }
 };
 var currentBackend = noopBackend;
 function setBackend(backend) {
   currentBackend = backend;
-  log9.info("Backend set", { hasInvoke: typeof backend.invoke === "function" });
+  log10.info("Backend set", { hasInvoke: typeof backend.invoke === "function" });
 }
 function getBackend() {
   return currentBackend;

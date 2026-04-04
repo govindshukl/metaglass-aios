@@ -1378,17 +1378,15 @@ declare function toolRequiresConfirmation(toolName: string): boolean;
  */
 declare function toolAllowsParallel(toolName: string): boolean;
 /**
- * Partition tool calls into parallel-safe and sequential groups
+ * Partition tool calls into parallel-safe and sequential groups.
+ * Enhanced with path-overlap detection for file-scoped tools.
  *
  * @param toolCalls - Array of tool calls to partition
  * @returns Object with parallel and sequential arrays
- *
- * Usage:
- * - Execute all `parallel` tools concurrently (Promise.all)
- * - Execute `sequential` tools one at a time after parallel complete
  */
 declare function partitionToolCalls<T extends {
     name: string;
+    arguments?: Record<string, unknown>;
 }>(toolCalls: T[]): {
     parallel: T[];
     sequential: T[];
@@ -1666,6 +1664,11 @@ interface ConversationConfig {
     toolPatterns?: string[];
     /** Enable parallel execution of independent tools (default: true) */
     parallelTools?: boolean;
+    /** Explicit list of visible tool API names. When provided, replaces the default ACTIVE_TOOLS filter.
+     *  Set by ToolPolicyEngine from the application layer. */
+    visibleTools?: string[];
+    /** Maximum characters per tool result before truncation (default: 100_000) */
+    resultMaxChars?: number;
 }
 /**
  * Dependencies for ConversationEngine
@@ -1811,6 +1814,11 @@ declare class ConversationEngine {
      * 3. JSON data fallback
      */
     private formatToolResult;
+    /**
+     * Truncate a formatted tool result if it exceeds the configured max chars.
+     * Uses 70/30 head/tail strategy to preserve beginning and end context.
+     */
+    private truncateToolResult;
     /**
      * Create a conversation result
      */

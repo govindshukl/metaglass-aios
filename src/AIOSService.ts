@@ -54,6 +54,8 @@ export interface AIOSProviders {
   createLLMProvider: () => LLMProvider;
   /** Create a lightweight LLM for classification */
   createClassifierLLM?: () => LLMProvider;
+  /** Create an LLM provider for a specific model tier (haiku/sonnet/opus). Falls back to createLLMProvider if not set. */
+  createLLMForTier?: (tier: import('./interfaces').ModelTier) => LLMProvider;
   /** Create a tool provider */
   createToolProvider: () => ToolProvider;
   /** Create a filtered tool provider */
@@ -142,6 +144,21 @@ function createStubUserInterface(): UserInterface {
     notify: (message, type) => {
       log.info(`[${type || 'info'}]`, message);
     },
+    isPending: () => false,
+    cancel: () => {},
+  };
+}
+
+/**
+ * Silent user interface for sub-agents.
+ * Sub-agents cannot prompt the user — they must work autonomously.
+ */
+function createSilentUserInterface(): UserInterface {
+  return {
+    ask: async () => 'No response (sub-agent has no UI access)',
+    askMultiple: async () => ({}),
+    confirm: async () => false,
+    notify: () => {},
     isPending: () => false,
     cancel: () => {},
   };
@@ -343,6 +360,12 @@ export class AIOSService {
       if (config.requireTodoWrite !== undefined) {
         mergedConfig.requireTodoWrite = config.requireTodoWrite;
       }
+      if (config.visibleTools !== undefined) {
+        mergedConfig.visibleTools = config.visibleTools;
+      }
+      if (config.resultMaxChars !== undefined) {
+        mergedConfig.resultMaxChars = config.resultMaxChars;
+      }
     }
 
     // Apply service-level overrides for TodoWrite
@@ -378,6 +401,11 @@ export class AIOSService {
       } catch (error) {
         log.warn('Failed to build enhanced system prompt', { error });
       }
+    }
+
+    // Append system prompt suffix if provided (e.g., tool profile hints)
+    if ((config as any)?.systemPromptSuffix && mergedConfig.systemPrompt) {
+      mergedConfig.systemPrompt += (config as any).systemPromptSuffix;
     }
 
     // Attach debug harness if enabled
@@ -502,46 +530,88 @@ export class AIOSService {
       ui: this.providers.getUserInterface(),
       events: this.providers.getEventEmitter(),
       classifierLlm,
+      taskSpawner: this.taskSpawner,
     };
 
     return new ConversationEngine(deps);
   }
 
-  private createAgentFactory(): AgentFactory {
+  private createAgentFactory(depth: number = 0): AgentFactory {
     return {
       create: (config) => {
         const type = config.type;
+        const isExplore = type === 'explore' || type === 'Explore';
 
-        // Use classifier LLM for Explore agents (lightweight)
-        const llm =
-          type === 'Explore' && this.providers.createClassifierLLM
-            ? this.providers.createClassifierLLM()
-            : this.providers.createLLMProvider();
+        // Select LLM by model tier
+        const llm = this.createLLMForTier(config.model);
 
-        const tools = this.providers.createToolProvider();
-        const classifierLlm = this.providers.createClassifierLLM?.();
+        // Create tool provider with scoping based on agent type's allowedTools
+        let tools: ToolProvider;
+        if (config.allowedTools === '*') {
+          tools = this.providers.createToolProvider();
+        } else if (this.providers.createFilteredToolProvider && Array.isArray(config.allowedTools)) {
+          tools = this.providers.createFilteredToolProvider(config.allowedTools);
+        } else {
+          tools = this.providers.createToolProvider();
+        }
+
+        // Sub-agents get silent UI — they cannot prompt the user
+        const ui = createSilentUserInterface();
+
+        // Share the parent's event emitter for observability
+        const events = this.providers.getEventEmitter();
+
+        // Create child TaskSpawner at incremented depth for recursive sub-agent support
+        const childDepth = (config.depth ?? depth) + 1;
+        const childFactory = this.createAgentFactory(childDepth);
+        const childSpawner = new TaskSpawner(childFactory, events, childDepth);
 
         const deps: ConversationEngineDeps = {
           llm,
           tools,
-          ui: this.providers.getUserInterface(),
-          events: this.providers.getEventEmitter(),
-          classifierLlm,
+          ui,
+          events,
+          taskSpawner: childSpawner,
         };
 
         const engine = new ConversationEngine(deps);
 
+        // Cascade parent cancellation to child
+        if (config.parentSignal) {
+          config.parentSignal.addEventListener('abort', () => engine.cancel(), { once: true });
+        }
+
         return {
           execute: (prompt: string) =>
             engine.execute(prompt, {
-              maxTurns: type === 'Explore' ? 10 : 50,
-              timeoutMs: type === 'Explore' ? 120000 : 600000,
+              maxTurns: isExplore ? 10 : 30,
+              timeoutMs: isExplore ? 120000 : 300000,
+              systemPrompt: config.systemPrompt,
+              requireTodoWrite: false, // Sub-agents don't need TodoWrite enforcement
             }),
-          cancel: () => engine.cancel(),
+          cancel: () => {
+            engine.cancel();
+            childSpawner.cancelAll();
+          },
           isRunning: () => engine.isRunning(),
         };
       },
     };
+  }
+
+  /**
+   * Create an LLM provider for a specific model tier.
+   * Uses the provider's createLLMForTier if available, otherwise falls back to createLLMProvider.
+   */
+  private createLLMForTier(tier: import('./interfaces').ModelTier): LLMProvider {
+    if (this.providers.createLLMForTier) {
+      return this.providers.createLLMForTier(tier);
+    }
+    // Fallback: use classifier LLM for haiku tier, default for others
+    if (tier === 'haiku' && this.providers.createClassifierLLM) {
+      return this.providers.createClassifierLLM();
+    }
+    return this.providers.createLLMProvider();
   }
 }
 
@@ -551,10 +621,10 @@ export class AIOSService {
 
 let defaultInstance: AIOSService | null = null;
 
-export function getAIOSService(): AIOSService {
+export function getAIOSService(config?: AIOSConfig): AIOSService {
   if (!defaultInstance) {
     log.info('Creating new AIOSService singleton instance');
-    defaultInstance = new AIOSService();
+    defaultInstance = new AIOSService(config);
   }
   return defaultInstance;
 }

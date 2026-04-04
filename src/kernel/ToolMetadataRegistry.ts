@@ -287,6 +287,26 @@ export const TOOL_METADATA: Record<string, ToolMetadata> = {
   },
 
   // ===========================================================================
+  // SUB-AGENT TOOLS - Spawning is expensive, CAN be parallelized
+  // ===========================================================================
+  spawn_task: {
+    category: 'execution',
+    sideEffects: 'reversible',
+    requiresConfirmation: false,
+    requiresTodoWrite: false,
+    costLevel: 'expensive',
+    allowsParallelExecution: true, // Multiple sub-agents can run concurrently
+  },
+  task_status: {
+    category: 'query',
+    sideEffects: 'none',
+    requiresConfirmation: false,
+    requiresTodoWrite: false,
+    costLevel: 'cheap',
+    allowsParallelExecution: true,
+  },
+
+  // ===========================================================================
   // WEB TOOLS - External API calls, can be parallelized
   // ===========================================================================
   web_search: {
@@ -343,29 +363,107 @@ export function toolAllowsParallel(toolName: string): boolean {
 // PARTITION TOOL CALLS
 // =============================================================================
 
+/** Max parallel batch size */
+const MAX_PARALLEL_BATCH = 8;
+
+/** Path-scoped tool metadata — tools that operate on file paths */
+const PATH_SCOPED_TOOLS: Record<string, string> = {
+  vault_read_note: 'note_id',
+  vault_create_note: 'title',
+  vault_update_note: 'note_id',
+  vault_delete_note: 'note_id',
+  vault_set_frontmatter: 'note_id',
+  vault_insert_content: 'note_id',
+  vault_find_replace: 'note_id',
+  Read: 'file_path',
+  Glob: 'pattern',
+  Grep: 'pattern',
+};
+
 /**
- * Partition tool calls into parallel-safe and sequential groups
+ * Check if two paths overlap (one is a prefix of the other).
+ */
+function pathsOverlap(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const na = a.replace(/\\/g, '/');
+  const nb = b.replace(/\\/g, '/');
+  return na === nb || na.startsWith(nb + '/') || nb.startsWith(na + '/');
+}
+
+/**
+ * Extract the path from a tool call's arguments.
+ */
+function extractPath(toolName: string, args: Record<string, unknown>): string | undefined {
+  const paramName = PATH_SCOPED_TOOLS[toolName];
+  if (!paramName) return undefined;
+  const value = args[paramName];
+  return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Partition tool calls into parallel-safe and sequential groups.
+ * Enhanced with path-overlap detection for file-scoped tools.
  *
  * @param toolCalls - Array of tool calls to partition
  * @returns Object with parallel and sequential arrays
- *
- * Usage:
- * - Execute all `parallel` tools concurrently (Promise.all)
- * - Execute `sequential` tools one at a time after parallel complete
  */
-export function partitionToolCalls(
-  toolCalls: ToolCall[]
-): { parallel: ToolCall[]; sequential: ToolCall[] } {
-  const parallel: ToolCall[] = [];
-  const sequential: ToolCall[] = [];
+export function partitionToolCalls<T extends { name: string; arguments?: Record<string, unknown> }>(
+  toolCalls: T[]
+): { parallel: T[]; sequential: T[] } {
+  const parallel: T[] = [];
+  const sequential: T[] = [];
+
+  // Track paths used by parallel tools for overlap detection
+  const parallelPaths: Array<{ call: T; path: string }> = [];
 
   for (const tc of toolCalls) {
-    if (toolAllowsParallel(tc.name)) {
-      parallel.push(tc);
-    } else {
+    if (!toolAllowsParallel(tc.name)) {
       sequential.push(tc);
+      continue;
     }
+
+    // Check for path overlap with existing parallel calls
+    const path = extractPath(tc.name, tc.arguments ?? {});
+    if (path) {
+      const hasOverlap = parallelPaths.some((p) => pathsOverlap(path, p.path));
+      if (hasOverlap) {
+        sequential.push(tc);
+        continue;
+      }
+      parallelPaths.push({ call: tc, path });
+    }
+
+    // Cap parallel batch size
+    if (parallel.length >= MAX_PARALLEL_BATCH) {
+      sequential.push(tc);
+      continue;
+    }
+
+    parallel.push(tc);
   }
 
   return { parallel, sequential };
+}
+
+/**
+ * Deduplicate tool calls with identical (name, arguments) pairs.
+ * Keeps the first occurrence, removes duplicates.
+ * Known to trigger with Gemini and some OpenRouter-routed models.
+ */
+export function deduplicateToolCalls<T extends { name: string; arguments?: Record<string, unknown> }>(
+  toolCalls: T[]
+): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+
+  for (const tc of toolCalls) {
+    const key = `${tc.name}:${JSON.stringify(tc.arguments ?? {})}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(tc);
+  }
+
+  return result;
 }
