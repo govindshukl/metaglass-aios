@@ -85,6 +85,7 @@ const DEFAULT_CONFIG: Required<CompressionConfig> = {
   preserveRecentTurns: 5,  // Fallback: keep last 5 turns if token-budget tail is not configured
   charsPerToken: 4,
   summaryMaxTokens: 500,   // Each rolling summary is concise
+  tailBudgetTokens: 0,     // 0 = use preserveRecentTurns fallback; >0 = dynamic token-based tail
 };
 
 /** Max tokens to protect at the tail (dynamic, overrides preserveRecentTurns) */
@@ -135,6 +136,10 @@ export class ContextCompressor {
   constructor(llm: LLMProvider, config?: CompressionConfig) {
     this.llm = llm;
     this.config = { ...DEFAULT_CONFIG, ...config };
+    // Wire tailBudgetTokens from config if provided (Phase 3)
+    if (config?.tailBudgetTokens && config.tailBudgetTokens > 0) {
+      this.setTailBudget(config.tailBudgetTokens);
+    }
   }
 
   /**
@@ -482,6 +487,9 @@ export class ContextCompressor {
 
   updateConfig(config: Partial<CompressionConfig>): void {
     this.config = { ...this.config, ...config };
+    if (config.tailBudgetTokens) {
+      this.setTailBudget(config.tailBudgetTokens);
+    }
   }
 
   getConfig(): Required<CompressionConfig> {

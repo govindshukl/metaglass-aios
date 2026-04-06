@@ -502,6 +502,8 @@ export interface CompressionConfig {
   charsPerToken?: number;
   /** Maximum tokens for summary generation (default: 1000) */
   summaryMaxTokens?: number;
+  /** Token budget for dynamic tail protection (Phase 3 — overrides preserveRecentTurns when set) */
+  tailBudgetTokens?: number;
 }
 
 // =============================================================================
@@ -546,4 +548,19 @@ export interface AIOSEvents {
   // Task events
   'task:spawned': { taskId: string; type: SubAgentType };
   'task:completed': { taskId: string; result: TaskResult };
+
+  // LLM I/O events (for prompt inspector)
+  'conversation:llm-request': {
+    turn: number;
+    messages: Array<{ role: string; contentPreview: string; contentLength: number; toolCalls?: string[] }>;
+    toolNames: string[];
+    compressed: boolean;
+  };
+  'conversation:llm-response': {
+    turn: number;
+    content: string;
+    finishReason: string;
+    toolCalls: Array<{ name: string; params: Record<string, unknown> }>;
+    usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+  };
 }
