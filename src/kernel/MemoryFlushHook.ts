@@ -64,6 +64,9 @@ export interface MemoryFlushHook {
     messages: Message[];
     signal: AbortSignal;
   }): Promise<boolean>;
+
+  /** Record that a flush was completed for a compaction cycle (prevents re-triggering) */
+  recordFlush(compactionCount: number): void;
 }
 
 // =============================================================================

@@ -38,6 +38,7 @@ import { getToolMetadata, partitionToolCalls, deduplicateToolCalls } from './Too
 import { repairToolMessages } from './MessageRepair';
 import { type CheckpointConfig } from './CheckpointManager';
 import type { DebugHarness } from './DebugHarness';
+import { type MemoryFlushHook, NoOpMemoryFlushHook } from './MemoryFlushHook';
 
 const log = createLogger('ConversationEngine');
 
@@ -213,6 +214,8 @@ export interface ConversationEngineDeps {
   classifierLlm?: LLMProvider;
   /** Optional TaskSpawner for sub-agent execution (enables spawn_task tool) */
   taskSpawner?: TaskSpawner;
+  /** Optional MemoryFlushHook for flush-before-discard (Phase 4) */
+  memoryFlushHook?: MemoryFlushHook;
 }
 
 /**
@@ -285,6 +288,10 @@ export class ConversationEngine {
   // Context pruning — cache-TTL pruning of old tool results (Phase 3)
   private contextPruner: ContextPruner;
 
+  // Memory flush — flush-before-discard pattern (Phase 4)
+  private memoryFlushHook: MemoryFlushHook;
+  private compactionCount: number = 0;
+
   constructor(deps: ConversationEngineDeps) {
     this.llm = deps.llm;
     this.tools = deps.tools;
@@ -309,6 +316,9 @@ export class ConversationEngine {
 
     // Initialize decision logger for observability
     this.decisionLogger = new DecisionLogger();
+
+    // Initialize memory flush hook (Phase 4 — default: NoOp)
+    this.memoryFlushHook = deps.memoryFlushHook ?? new NoOpMemoryFlushHook();
   }
 
   /**
@@ -326,6 +336,82 @@ export class ConversationEngine {
   // ===========================================================================
   // PUBLIC API
   // ===========================================================================
+
+  /**
+   * Continue an existing conversation with a new user message.
+   * Appends to existing history instead of resetting.
+   * Uses the same conversationId and preserves all state.
+   */
+  async continueConversation(prompt: string, config?: ConversationConfig): Promise<ConversationResult> {
+    // If no history exists yet, fall through to execute()
+    if (this.history.length === 0 || !this.conversationId) {
+      return this.execute(prompt, config);
+    }
+
+    log.info('Continuing conversation', {
+      conversationId: this.conversationId,
+      historyLength: this.history.length,
+      promptLength: prompt.length,
+    });
+
+    // Check if already running
+    if (this.isRunning()) {
+      log.warn('Conversation already running');
+      return this.createResult(false, 'Conversation already running', 0);
+    }
+
+    // Merge config with last config (preserve system prompt, compression, etc.)
+    const cfg = {
+      ...DEFAULT_CONFIG,
+      ...(this.lastConfig ?? {}),
+      ...(config?.maxTurns !== undefined ? { maxTurns: config.maxTurns } : {}),
+      ...(config?.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
+      ...(config?.maxTokensPerTurn !== undefined ? { maxTokensPerTurn: config.maxTokensPerTurn } : {}),
+      ...(config?.requireTodoWrite !== undefined ? { requireTodoWrite: config.requireTodoWrite } : {}),
+      ...(config?.parallelTools !== undefined ? { parallelTools: config.parallelTools } : {}),
+      ...(config?.visibleTools !== undefined ? { visibleTools: config.visibleTools } : {}),
+      ...(config?.resultMaxChars !== undefined ? { resultMaxChars: config.resultMaxChars } : {}),
+    };
+
+    this.lastConfig = cfg;
+    this.status = 'running';
+    this.abortController = new AbortController();
+
+    // Update system prompt if it changed (e.g., memory context refresh)
+    if (config?.systemPrompt && config.systemPrompt !== this.baseSystemPrompt) {
+      this.baseSystemPrompt = config.systemPrompt;
+      // Replace the system message in history
+      if (this.history.length > 0 && this.history[0].role === 'system') {
+        this.history[0] = { role: 'system', content: config.systemPrompt };
+      }
+    }
+
+    // Append new user message to existing history
+    this.history.push({ role: 'user', content: prompt });
+
+    const startTime = Date.now();
+
+    // Emit turn event (not started — conversation already started)
+    await this.events.emit('conversation:turn', {
+      turn: this.currentTurn,
+      message: { role: 'user' as const, content: prompt },
+    });
+
+    try {
+      return await this.runLoop(cfg, startTime);
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      log.error('Continue conversation error', { error: errMsg });
+      return this.createResult(false, errMsg, Date.now() - startTime, 'failed');
+    }
+  }
+
+  /**
+   * Check if this engine has an active conversation (history exists).
+   */
+  hasActiveConversation(): boolean {
+    return this.history.length > 0 && !!this.conversationId;
+  }
 
   /**
    * Execute a conversation with the given prompt
@@ -625,6 +711,41 @@ export class ConversationEngine {
         log.debug('Full Prompt:', { history: this.history });
         log.debug('='.repeat(80));
 
+        // -----------------------------------------------------------------
+        // Phase 4: Flush-before-discard — save durable memories before compaction
+        // -----------------------------------------------------------------
+        try {
+          const transcriptByteEstimate = this.history.reduce(
+            (sum, m) => sum + (m.content?.length ?? 0), 0
+          );
+          const estimatedTokens = Math.ceil(transcriptByteEstimate / 4);
+          const tokenBudget = config.compression?.maxTokens ?? 100_000;
+
+          if (this.memoryFlushHook.shouldFlush({
+            estimatedTokens,
+            tokenBudget,
+            transcriptByteEstimate,
+            compactionCount: this.compactionCount,
+          })) {
+            log.info('Memory flush triggered before compaction', {
+              compactionCount: this.compactionCount,
+              estimatedTokens,
+              tokenBudget,
+            });
+            const flushed = await this.memoryFlushHook.flush({
+              messages: this.history,
+              signal: this.abortController?.signal ?? new AbortController().signal,
+            });
+            if (flushed) {
+              this.memoryFlushHook.recordFlush(this.compactionCount);
+              log.info('Memory flush completed', { compactionCount: this.compactionCount });
+            }
+          }
+        } catch (error) {
+          // Flush is best-effort — never block compaction
+          log.warn('Memory flush failed, proceeding with compaction', { error });
+        }
+
         // Apply context compression if configured
         let messagesToSend = this.history;
         if (config.compression) {
@@ -636,10 +757,12 @@ export class ConversationEngine {
         );
         if (compressionResult.wasCompressed) {
           messagesToSend = compressionResult.messages;
+          this.compactionCount++;
           log.info('Context compressed before LLM call', {
             originalTokens: compressionResult.originalTokens,
             compressedTokens: compressionResult.compressedTokens,
             summarizedTurns: compressionResult.summarizedTurns,
+            compactionCount: this.compactionCount,
           });
         }
 

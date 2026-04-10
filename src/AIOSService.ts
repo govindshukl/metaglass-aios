@@ -29,6 +29,7 @@ import { TodoManager } from './kernel/TodoManager';
 import { TaskSpawner, type AgentFactory } from './kernel/TaskSpawner';
 import { PlanManager } from './kernel/PlanManager';
 import { DebugHarness, installDebugStub, absorbPendingConfig } from './kernel/DebugHarness';
+import type { MemoryFlushHook } from './kernel/MemoryFlushHook';
 import { createLogger } from './logger';
 
 const log = createLogger('AIOSService');
@@ -75,6 +76,8 @@ export interface AIOSProviders {
     memoryContext: MemoryContext,
     userGoal: string
   ) => Promise<string>;
+  /** Memory flush hook for flush-before-discard (Phase 4) */
+  getMemoryFlushHook?: () => MemoryFlushHook;
 }
 
 // =============================================================================
@@ -319,12 +322,19 @@ export class AIOSService {
    * Execute a conversation with the given prompt
    */
   async execute(prompt: string, config?: ConversationConfig): Promise<ConversationResult> {
-    // Create fresh conversation engine — use filtered tools if toolPatterns specified
+    // Reuse existing engine if it has an active conversation (multi-turn continuation).
+    // Only create a new engine if no engine exists or the conversation was explicitly reset.
     const toolProvider =
       config?.toolPatterns?.length && this.providers.createFilteredToolProvider
         ? this.providers.createFilteredToolProvider(config.toolPatterns)
         : this.toolProvider;
-    this.conversationEngine = this.createConversationEngine(toolProvider);
+
+    const canContinue = this.conversationEngine?.hasActiveConversation() &&
+      !this.conversationEngine.isRunning();
+
+    if (!canContinue) {
+      this.conversationEngine = this.createConversationEngine(toolProvider);
+    }
 
     // Merge configs
     const mergedConfig: ConversationConfig = {};
@@ -373,31 +383,15 @@ export class AIOSService {
       mergedConfig.requireTodoWrite = this.config.requireTodoWrite;
     }
 
-    // Inject memory context if available
-    const enableMemoryContext = this.config.enableMemoryContext !== false;
-    if (enableMemoryContext && this.providers.getMemoryContext && this.providers.buildEnhancedSystemPrompt) {
+    // Build enhanced system prompt (Phase 4: no pre-conversation memory fetch,
+    // just recompose via PromptComposer with vault context + memory recall instructions)
+    if (this.providers.buildEnhancedSystemPrompt) {
       try {
-        log.info('Fetching memory context for conversation');
-        const memoryContext = await this.providers.getMemoryContext(
-          [{ role: 'user', content: prompt }],
-          {
-            maxMemories: this.config.maxMemories ?? 5,
-            includeProfile: this.config.includeProfile !== false,
-          }
+        mergedConfig.systemPrompt = await this.providers.buildEnhancedSystemPrompt(
+          mergedConfig.systemPrompt || '',
+          { memories: [], success: true },  // empty memory context — on-demand via tools
+          prompt
         );
-
-        if (memoryContext.success) {
-          const basePrompt = mergedConfig.systemPrompt || '';
-          mergedConfig.systemPrompt = await this.providers.buildEnhancedSystemPrompt(
-            basePrompt,
-            memoryContext,
-            prompt
-          );
-          log.info('Enhanced system prompt built', {
-            memoryCount: memoryContext.memories.length,
-            hasProfile: !!memoryContext.userProfile,
-          });
-        }
       } catch (error) {
         log.warn('Failed to build enhanced system prompt', { error });
       }
@@ -419,14 +413,26 @@ export class AIOSService {
       });
 
       absorbPendingConfig(harness);
-      this.conversationEngine.setDebugHarness(harness);
+      this.conversationEngine!.setDebugHarness(harness);
       window.__aiosDebug = harness.getConsoleAPI();
       log.info('Debug harness attached', { tracePath: harness.getConsoleAPI().getTracePath() });
     }
 
-    // Execute
-    const result = await this.conversationEngine.execute(prompt, mergedConfig);
+    // Execute: continue existing conversation or start new one
+    const engine = this.conversationEngine!; // guaranteed non-null after creation block above
+    const result = canContinue
+      ? await engine.continueConversation(prompt, mergedConfig)
+      : await engine.execute(prompt, mergedConfig);
     return result;
+  }
+
+  /**
+   * Reset the conversation engine so the next execute() starts fresh.
+   * Call this when the user clicks "New Chat" or equivalent.
+   */
+  newConversation(): void {
+    this.conversationEngine = null as any;
+    log.info('Conversation engine reset — next execute() will start fresh');
   }
 
   /**
@@ -531,6 +537,7 @@ export class AIOSService {
       events: this.providers.getEventEmitter(),
       classifierLlm,
       taskSpawner: this.taskSpawner,
+      memoryFlushHook: this.providers.getMemoryFlushHook?.(),
     };
 
     return new ConversationEngine(deps);

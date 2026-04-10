@@ -62,6 +62,9 @@ export type {
   DebugConsoleAPI,
 } from './kernel/DebugHarness';
 
+export { NoOpMemoryFlushHook } from './kernel/MemoryFlushHook';
+export type { MemoryFlushHook, MemoryFlushConfig, FlushTriggerParams } from './kernel/MemoryFlushHook';
+
 // =============================================================================
 // INTERFACES - Provider abstractions
 // =============================================================================
