@@ -81,8 +81,8 @@ interface ConversationTurn {
 const DEFAULT_CONFIG: Required<CompressionConfig> = {
   enabled: true,
   maxTokens: 100000,
-  summarizeThreshold: 5,   // Compress every 5 turns (rolling, not cliff)
-  preserveRecentTurns: 5,  // Fallback: keep last 5 turns if token-budget tail is not configured
+  summarizeThreshold: 8,   // Phase 5 perf: raised from 5→8 to reduce compaction frequency (was firing every turn after 5th)
+  preserveRecentTurns: 6,  // Phase 5 perf: raised from 5→6 to keep more recent context visible to LLM
   charsPerToken: 4,
   summaryMaxTokens: 500,   // Each rolling summary is concise
   tailBudgetTokens: 0,     // 0 = use preserveRecentTurns fallback; >0 = dynamic token-based tail

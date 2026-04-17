@@ -955,10 +955,11 @@ export class ConversationEngine {
             });
 
             // Add "rejected" tool results ONLY for action tools
+            // Include exact TodoWrite format so smaller models (Haiku) know what to do
             for (const toolCall of actionTools) {
               this.history.push({
                 role: 'tool',
-                content: `Tool call blocked: You must call TodoWrite first to create a task plan before using "${toolCall.name}". However, clarification tools (like agent_ask_user) and query tools are allowed without a plan.`,
+                content: `Tool call blocked: Call TodoWrite FIRST to create a plan, then retry "${toolCall.name}". Example: TodoWrite({todos: [{content: "Step description", status: "in_progress", activeForm: "Doing step"}]}). You can combine TodoWrite with "${toolCall.name}" in the same turn using batch_tools.`,
                 toolCallId: toolCall.id,
                 toolName: toolCall.name,
               });
@@ -1651,10 +1652,24 @@ export class ConversationEngine {
       };
     }
 
+    // Normalize param names: LLMs sometimes use task_type instead of subagentType, or omit prompt
+    const description = String(params.description || params.query || params.task || '');
+    const prompt = String(params.prompt || params.description || params.query || params.task || '');
+    const subagentType = (params.subagentType || params.task_type || 'explore') as SubAgentType;
+
+    // Validate: prompt must be non-empty for the child engine
+    if (!prompt.trim()) {
+      return {
+        success: false,
+        error: 'Missing required parameter: prompt (or description). Provide a task description for the sub-agent.',
+        observation: 'Error: spawn_task requires a "prompt" or "description" parameter describing the task for the sub-agent.',
+      };
+    }
+
     const taskParams: TaskParams = {
-      description: String(params.description || ''),
-      prompt: String(params.prompt || ''),
-      subagentType: (params.subagentType as SubAgentType) || 'general-purpose',
+      description: description || prompt.slice(0, 100),
+      prompt,
+      subagentType,
       model: params.model as ModelTier | undefined,
       runInBackground: Boolean(params.runInBackground),
     };
