@@ -1321,6 +1321,29 @@ export class ConversationEngine {
   private async executeTool(toolCall: ToolCall): Promise<ToolResult> {
     log.info('Tool', { name: toolCall.name });
 
+    // If the LLM provider attached a structured validation error (Vercel AI SDK
+    // rejected the input), surface the precise reason back to the model so it can
+    // self-correct in one turn — instead of returning a generic "missing
+    // parameter" error and burning turns on retries.
+    //
+    // batch_tools is exempt: its handler has its own string-recovery path that
+    // can succeed even when the SDK rejected the input. If that recovery also
+    // fails, handleBatchTools emits its own helpful error.
+    const validationError = (toolCall as unknown as Record<string, unknown>).validationError as
+      | { name: string; message: string; issues: unknown[] }
+      | undefined;
+    if (validationError && toolCall.name !== 'batch_tools') {
+      log.warn('Tool input validation failed — returning structured error to model', {
+        tool: toolCall.name,
+        issueCount: validationError.issues.length,
+      });
+      return {
+        success: false,
+        error: validationError.message,
+        observation: validationError.message,
+      };
+    }
+
     // Handle special built-in tools
     if (toolCall.name === 'AskUserQuestion') {
       this.debugHarness?.trace('tool-special', 'ask-user-question', {
@@ -1487,15 +1510,17 @@ export class ConversationEngine {
   private async handleBatchTools(params: Record<string, unknown>): Promise<ToolResult> {
     let calls = params.calls as Array<{ tool: string; params: Record<string, unknown> }> | string | undefined;
 
-    // Handle LLM sending calls as a JSON string instead of array
+    // Handle LLM sending calls as a JSON string instead of an array.
+    // Sonnet sometimes wraps the array in a string AND adds malformed brackets
+    // (e.g. trailing `]` or stray `,`), so we try several recovery passes before giving up.
     if (typeof calls === 'string') {
-      try {
-        const parsed = JSON.parse(calls);
-        if (Array.isArray(parsed)) {
-          calls = parsed as Array<{ tool: string; params: Record<string, unknown> }>;
-        }
-      } catch {
-        // Fall through to validation error below
+      const recovered = tryRecoverCallsArray(calls);
+      if (recovered) {
+        log.info('Recovered batch_tools calls from malformed string', {
+          originalLength: calls.length,
+          recoveredCount: recovered.length,
+        });
+        calls = recovered as Array<{ tool: string; params: Record<string, unknown> }>;
       }
     }
 
@@ -1503,7 +1528,9 @@ export class ConversationEngine {
       return {
         success: false,
         error: 'batch_tools requires a "calls" array',
-        observation: 'Error: batch_tools requires a "calls" array with tool call objects.',
+        observation:
+          'Error: batch_tools "calls" must be an ARRAY of {tool, params} objects, not a string. Pass it as a native array argument:\n' +
+          'batch_tools({ calls: [ { tool: "TodoWrite", params: {...} }, { tool: "spawn_task", params: {...} } ] })',
       };
     }
 
@@ -2180,4 +2207,61 @@ export class ConversationEngine {
   setStore(store: ConversationStore): void {
     this.store = store;
   }
+}
+
+// =============================================================================
+// BATCH_TOOLS RECOVERY
+// =============================================================================
+
+/**
+ * Attempt to recover a `calls` array from a malformed JSON string.
+ *
+ * Sonnet (and other models) sometimes serialize the array argument as a string,
+ * occasionally with extra trailing brackets/commas. We try several recovery
+ * strategies before giving up:
+ *  1. Direct JSON.parse.
+ *  2. Strip trailing whitespace/`]`/`,` repeatedly and retry.
+ *  3. Locate the first `[` and last `]` and parse that slice.
+ */
+function tryRecoverCallsArray(raw: string): unknown[] | null {
+  const attempts: string[] = [];
+  attempts.push(raw);
+
+  // Trim and strip trailing junk (extra brackets, commas, whitespace).
+  // The model often emits patterns like `...]\n]` (the array's real closing
+  // bracket plus one or more stray brackets). Count actual trailing `]`
+  // characters and balance them against the leading `[` runs.
+  let stripped = raw.trim();
+  for (let i = 0; i < 10 && stripped.length > 0; i++) {
+    stripped = stripped.replace(/[\s,]+$/g, '');
+    // Count consecutive ']' at the very end (interleaved with whitespace).
+    const trailMatch = stripped.match(/(?:\s*\])+\s*$/);
+    const trailingCloses = trailMatch ? (trailMatch[0].match(/\]/g) || []).length : 0;
+    // Count consecutive '[' at the very start.
+    const leadMatch = stripped.match(/^\s*(?:\[\s*)+/);
+    const leadingOpens = leadMatch ? (leadMatch[0].match(/\[/g) || []).length : 0;
+    if (trailingCloses > leadingOpens) {
+      stripped = stripped.replace(/\]\s*$/, '').replace(/[\s,]+$/g, '');
+    } else {
+      break;
+    }
+  }
+  if (stripped !== raw) attempts.push(stripped);
+
+  // Substring between first '[' and last ']' — fallback for noisy prefix/suffix.
+  const firstBracket = raw.indexOf('[');
+  const lastBracket = raw.lastIndexOf(']');
+  if (firstBracket >= 0 && lastBracket > firstBracket) {
+    attempts.push(raw.slice(firstBracket, lastBracket + 1));
+  }
+
+  for (const candidate of attempts) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      // try next
+    }
+  }
+  return null;
 }

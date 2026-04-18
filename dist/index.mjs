@@ -47,53 +47,88 @@ var log = createLogger("ContextCompressor");
 var DEFAULT_CONFIG = {
   enabled: true,
   maxTokens: 1e5,
-  summarizeThreshold: 5,
-  // Compress every 5 turns (rolling, not cliff)
-  preserveRecentTurns: 5,
-  // Always keep last 5 turns verbatim
+  summarizeThreshold: 8,
+  // Phase 5 perf: raised from 5→8 to reduce compaction frequency (was firing every turn after 5th)
+  preserveRecentTurns: 6,
+  // Phase 5 perf: raised from 5→6 to keep more recent context visible to LLM
   charsPerToken: 4,
-  summaryMaxTokens: 500
+  summaryMaxTokens: 500,
   // Each rolling summary is concise
+  tailBudgetTokens: 0
+  // 0 = use preserveRecentTurns fallback; >0 = dynamic token-based tail
 };
-var SUMMARIZATION_PROMPT = `Summarize these conversation turns as structured bullet points. Preserve:
-- Key decisions made
-- Facts discovered (with specific values/names)
-- Actions taken and their outcomes
-- User preferences expressed
+var DEFAULT_TAIL_BUDGET_TOKENS = 2e4;
+var TAIL_BUDGET_RATIO = 0.3;
+var IDENTIFIER_PRESERVATION_INSTRUCTION = "Preserve all identifiers exactly as written: UUIDs, hashes, commit SHAs, file paths, URLs, port numbers, API endpoints, variable names. Do not abbreviate or reconstruct them.";
+var STRUCTURED_SUMMARY_PROMPT = `Summarize the conversation into these sections. Be concise \u2014 use bullet points, not prose.
 
-Use bullet points, not prose. Be concise \u2014 max 10 bullets.`;
+## Goal
+What the user is trying to accomplish.
+
+## Progress
+What has been completed so far (with specific file paths, tool outputs).
+
+## Key Decisions
+Decisions made, approaches chosen, things explicitly rejected.
+
+## Files & Artifacts
+All file paths, note titles, URLs, identifiers mentioned.
+
+## Next Steps
+What remains to be done based on the conversation.
+
+## Critical Context
+Any constraints, warnings, errors, or user preferences that must not be forgotten.
+
+${IDENTIFIER_PRESERVATION_INSTRUCTION}`;
 var ContextCompressor = class {
   llm;
   config;
-  /** Count of unsummarized turns since last compression */
-  unsummarizedTurnCount = 0;
+  /** Previous compaction summary for iterative updates (Hermes pattern) */
+  previousSummary = null;
+  /** Optional token budget for tail protection (from TokenBudgetResolver) */
+  tailBudgetTokens = null;
   constructor(llm, config) {
     this.llm = llm;
     this.config = { ...DEFAULT_CONFIG, ...config };
+    if (config?.tailBudgetTokens && config.tailBudgetTokens > 0) {
+      this.setTailBudget(config.tailBudgetTokens);
+    }
+  }
+  /**
+   * Set the tail budget from TokenBudgetResolver.
+   * When set, overrides preserveRecentTurns with dynamic token-based protection.
+   */
+  setTailBudget(messageWindowBudget) {
+    this.tailBudgetTokens = Math.min(DEFAULT_TAIL_BUDGET_TOKENS, Math.floor(messageWindowBudget * TAIL_BUDGET_RATIO));
   }
   /**
    * Compress conversation history using rolling summarization.
    *
-   * Called every turn. Checks two conditions:
+   * Checks two conditions:
    * 1. Have N new turns accumulated since last compression? → Summarize them
    * 2. Are we over the token budget? → Force-compress oldest unsummarized block
    */
   async compress(history, systemPrompt) {
     if (!this.config.enabled) {
-      return this.noCompression(history);
+      return { ...this.noCompression(history), reason: "skipped_disabled" };
     }
     const originalTokens = this.estimateTokens(history) + (systemPrompt ? this.estimateMessageTokens(systemPrompt) : 0);
     const { systemMessages, userMessage, turns } = this.parseHistory(history);
     const unsummarizedTurns = turns.filter((t) => !t.isSummary);
     const summaryTurns = turns.filter((t) => t.isSummary);
-    const preserveCount = Math.min(this.config.preserveRecentTurns, unsummarizedTurns.length);
-    const turnsToPreserve = unsummarizedTurns.slice(-preserveCount);
+    const turnsToPreserve = this.selectTailTurns(unsummarizedTurns);
+    const preserveCount = turnsToPreserve.length;
     const turnsToMaybeSummarize = unsummarizedTurns.slice(0, unsummarizedTurns.length - preserveCount);
-    const shouldCompress = turnsToMaybeSummarize.length >= this.config.summarizeThreshold || originalTokens >= this.config.maxTokens * 0.7;
+    const intervalTriggered = turnsToMaybeSummarize.length >= this.config.summarizeThreshold;
+    const budgetTriggered = originalTokens >= this.config.maxTokens * 0.7;
+    const shouldCompress = intervalTriggered || budgetTriggered;
+    const triggerReason = budgetTriggered ? "budget_pressure" : "interval";
     if (!shouldCompress || turnsToMaybeSummarize.length === 0) {
-      return this.noCompression(history);
+      return { ...this.noCompression(history), reason: "skipped_below_threshold" };
     }
     log.info("Rolling compression triggered", {
+      reason: triggerReason,
       totalTurns: turns.length,
       unsummarized: unsummarizedTurns.length,
       summarizing: turnsToMaybeSummarize.length,
@@ -101,23 +136,22 @@ var ContextCompressor = class {
       existingSummaries: summaryTurns.length,
       originalTokens
     });
-    const summary = await this.summarizeTurns(turnsToMaybeSummarize);
+    const { summary, reason } = await this.summarizeWithFallback(turnsToMaybeSummarize, triggerReason);
+    this.previousSummary = summary;
     const compressedHistory = [
       ...systemMessages,
       ...userMessage ? [userMessage] : [],
-      // Existing summaries from previous compressions (preserved as-is)
       ...summaryTurns.flatMap((t) => t.messages),
-      // New rolling summary
       {
         role: "assistant",
         content: `[Summary of turns ${turnsToMaybeSummarize[0].index + 1}-${turnsToMaybeSummarize[turnsToMaybeSummarize.length - 1].index + 1}]
 ${summary}`
       },
-      // Recent turns verbatim
       ...turnsToPreserve.flatMap((t) => t.messages)
     ];
     const compressedTokens = this.estimateTokens(compressedHistory) + (systemPrompt ? this.estimateMessageTokens(systemPrompt) : 0);
     log.info("Rolling compression complete", {
+      reason,
       originalTokens,
       compressedTokens,
       reduction: `${Math.round((1 - compressedTokens / originalTokens) * 100)}%`,
@@ -129,12 +163,151 @@ ${summary}`
       originalTokens,
       compressedTokens,
       summarizedTurns: turnsToMaybeSummarize.length,
-      wasCompressed: true
+      wasCompressed: true,
+      reason,
+      summary
     };
   }
   /**
+   * Get the last compaction summary (for systemPromptAddition injection).
+   */
+  getLastSummary() {
+    return this.previousSummary;
+  }
+  // ---------------------------------------------------------------------------
+  // Tail Protection
+  // ---------------------------------------------------------------------------
+  /**
+   * Select tail turns to preserve.
+   * Uses token-budget approach (Hermes pattern) when tailBudgetTokens is set,
+   * otherwise falls back to fixed turn count.
+   */
+  selectTailTurns(unsummarizedTurns) {
+    if (this.tailBudgetTokens !== null) {
+      const result = [];
+      let accumulated = 0;
+      for (let i = unsummarizedTurns.length - 1; i >= 0; i--) {
+        const turn = unsummarizedTurns[i];
+        if (accumulated + turn.tokenCount > this.tailBudgetTokens && result.length > 0) {
+          break;
+        }
+        result.unshift(turn);
+        accumulated += turn.tokenCount;
+      }
+      return result;
+    }
+    const preserveCount = Math.min(this.config.preserveRecentTurns, unsummarizedTurns.length);
+    return unsummarizedTurns.slice(-preserveCount);
+  }
+  // ---------------------------------------------------------------------------
+  // Summarization with Fallback Chain
+  // ---------------------------------------------------------------------------
+  /**
+   * Summarize turns with 3-level fallback chain:
+   * 1. Full: Structured summary of all turns (with previous summary for continuity)
+   * 2. Partial: Exclude oversized turns (>50% of budget)
+   * 3. Metadata-only: Basic metadata about what happened
+   */
+  async summarizeWithFallback(turns, triggerReason) {
+    try {
+      const summary2 = await this.summarizeTurns(turns);
+      return { summary: summary2, reason: triggerReason };
+    } catch (error) {
+      log.warn("Full summarization failed, trying partial", { error });
+    }
+    try {
+      const totalTokens = turns.reduce((sum, t) => sum + t.tokenCount, 0);
+      const threshold = totalTokens * 0.5;
+      const normalTurns = turns.filter((t) => t.tokenCount <= threshold);
+      const oversizedTurns = turns.filter((t) => t.tokenCount > threshold);
+      if (normalTurns.length > 0) {
+        let summary2 = await this.summarizeTurns(normalTurns);
+        if (oversizedTurns.length > 0) {
+          const omittedNotes = oversizedTurns.map((t) => {
+            const firstMsg = t.messages[0];
+            const preview = firstMsg.content.slice(0, 100);
+            return `[Large message omitted from summary \u2014 ${firstMsg.role}: ${preview}...]`;
+          });
+          summary2 += "\n\n" + omittedNotes.join("\n");
+        }
+        return { summary: summary2, reason: "fallback_partial" };
+      }
+    } catch (error) {
+      log.warn("Partial summarization failed, using metadata fallback", { error });
+    }
+    const summary = this.metadataFallback(turns);
+    return { summary, reason: "fallback_metadata" };
+  }
+  /**
+   * Generate structured summary of conversation turns.
+   * Uses Hermes iterative pattern: previous summary fed into prompt for continuity.
+   */
+  async summarizeTurns(turns) {
+    const turnTexts = turns.map((turn) => {
+      const parts = [];
+      for (const msg of turn.messages) {
+        if (msg.role === "assistant") {
+          if (msg.toolCalls && msg.toolCalls.length > 0) {
+            const toolDetails = msg.toolCalls.map((tc) => {
+              const paramsPreview = JSON.stringify(tc.params).slice(0, 200);
+              return `${tc.name}(${paramsPreview})`;
+            }).join(", ");
+            parts.push(`Called: ${toolDetails}`);
+          }
+          if (msg.content) {
+            parts.push(`Said: ${msg.content.slice(0, 150)}${msg.content.length > 150 ? "..." : ""}`);
+          }
+        } else if (msg.role === "tool") {
+          const preview = msg.content.slice(0, 80);
+          parts.push(`${msg.toolName || "tool"}: ${preview}${msg.content.length > 80 ? "..." : ""}`);
+        } else if (msg.role === "user") {
+          parts.push(`User: ${msg.content.slice(0, 100)}`);
+        }
+      }
+      return `Turn ${turn.index + 1}: ${parts.join(" | ")}`;
+    });
+    const conversationToSummarize = turnTexts.join("\n");
+    let userContent = "";
+    if (this.previousSummary) {
+      userContent += `Previous conversation summary:
+${this.previousSummary}
+
+New messages to incorporate:
+`;
+    }
+    userContent += conversationToSummarize;
+    const response = await this.llm.chat([
+      { role: "system", content: STRUCTURED_SUMMARY_PROMPT },
+      { role: "user", content: userContent }
+    ], {
+      maxTokens: this.config.summaryMaxTokens,
+      temperature: 0.2
+    });
+    return response.content;
+  }
+  /**
+   * Metadata-only fallback when LLM summarization fails entirely.
+   */
+  metadataFallback(turns) {
+    const toolCalls = turns.flatMap(
+      (t) => t.messages.filter((m) => m.toolCalls).flatMap((m) => m.toolCalls.map((tc) => tc.name))
+    );
+    const uniqueTools = [...new Set(toolCalls)];
+    const firstTurnIndex = turns[0]?.index ?? 0;
+    const lastTurnIndex = turns[turns.length - 1]?.index ?? 0;
+    const lastUserMsg = turns.flatMap((t) => t.messages).filter((m) => m.role === "user").pop();
+    const lastTopic = lastUserMsg ? lastUserMsg.content.slice(0, 80) : "unknown";
+    return [
+      `[Conversation history: ${turns.length} turns (${firstTurnIndex + 1}-${lastTurnIndex + 1})]`,
+      `- Tools used: ${uniqueTools.join(", ") || "none"}`,
+      `- Last topic: ${lastTopic}`
+    ].join("\n");
+  }
+  // ---------------------------------------------------------------------------
+  // History Parsing
+  // ---------------------------------------------------------------------------
+  /**
    * Parse history into system messages, initial user message, and turns.
-   * Recognizes previous summary messages (prefixed with [Summary of turns ...]).
    */
   parseHistory(history) {
     const systemMessages = [];
@@ -153,7 +326,7 @@ ${summary}`
       }
       if (msg.role === "assistant") {
         if (currentTurn.length > 0) {
-          const isSummary = currentTurn[0].content?.startsWith("[Summary of turns") || currentTurn[0].content?.startsWith("[Previous conversation summary");
+          const isSummary = currentTurn[0].content?.startsWith("[Summary of turns") || currentTurn[0].content?.startsWith("[Previous conversation summary") || currentTurn[0].content?.startsWith("[Conversation history:");
           turns.push({
             index: turnIndex++,
             messages: currentTurn,
@@ -167,7 +340,7 @@ ${summary}`
       }
     }
     if (currentTurn.length > 0) {
-      const isSummary = currentTurn[0].content?.startsWith("[Summary of turns") || currentTurn[0].content?.startsWith("[Previous conversation summary");
+      const isSummary = currentTurn[0].content?.startsWith("[Summary of turns") || currentTurn[0].content?.startsWith("[Previous conversation summary") || currentTurn[0].content?.startsWith("[Conversation history:");
       turns.push({
         index: turnIndex,
         messages: currentTurn,
@@ -177,54 +350,9 @@ ${summary}`
     }
     return { systemMessages, userMessage, turns };
   }
-  /**
-   * Generate a structured bullet-point summary of conversation turns
-   */
-  async summarizeTurns(turns) {
-    const turnTexts = turns.map((turn) => {
-      const parts = [];
-      for (const msg of turn.messages) {
-        if (msg.role === "assistant") {
-          if (msg.toolCalls && msg.toolCalls.length > 0) {
-            const toolNames = msg.toolCalls.map((tc) => tc.name).join(", ");
-            parts.push(`Called: ${toolNames}`);
-          }
-          if (msg.content) {
-            parts.push(`Said: ${msg.content.slice(0, 150)}${msg.content.length > 150 ? "..." : ""}`);
-          }
-        } else if (msg.role === "tool") {
-          const preview = msg.content.slice(0, 80);
-          parts.push(`${msg.toolName || "tool"}: ${preview}${msg.content.length > 80 ? "..." : ""}`);
-        } else if (msg.role === "user") {
-          parts.push(`User: ${msg.content.slice(0, 100)}`);
-        }
-      }
-      return `Turn ${turn.index + 1}: ${parts.join(" | ")}`;
-    });
-    const conversationToSummarize = turnTexts.join("\n");
-    try {
-      const response = await this.llm.chat([
-        { role: "system", content: SUMMARIZATION_PROMPT },
-        { role: "user", content: conversationToSummarize }
-      ], {
-        maxTokens: this.config.summaryMaxTokens,
-        temperature: 0.2
-      });
-      return response.content;
-    } catch (error) {
-      log.error("Failed to generate summary, using fallback", { error });
-      const toolCalls = turns.flatMap(
-        (t) => t.messages.filter((m) => m.toolCalls).flatMap((m) => m.toolCalls.map((tc) => tc.name))
-      );
-      const uniqueTools = [...new Set(toolCalls)];
-      return `- ${turns.length} turns completed
-- Tools used: ${uniqueTools.join(", ")}
-- Results obtained and processed`;
-    }
-  }
-  /**
-   * Return no-compression result
-   */
+  // ---------------------------------------------------------------------------
+  // Utilities
+  // ---------------------------------------------------------------------------
   noCompression(history) {
     const tokens = this.estimateTokens(history);
     return {
@@ -235,27 +363,18 @@ ${summary}`
       wasCompressed: false
     };
   }
-  /**
-   * Estimate token count for a list of messages
-   */
   estimateTokens(messages) {
     return messages.reduce((sum, msg) => sum + this.estimateMessageTokens(msg.content), 0);
   }
-  /**
-   * Estimate token count for a string
-   */
   estimateMessageTokens(content) {
     return Math.ceil(content.length / this.config.charsPerToken);
   }
-  /**
-   * Update configuration
-   */
   updateConfig(config) {
     this.config = { ...this.config, ...config };
+    if (config.tailBudgetTokens) {
+      this.setTailBudget(config.tailBudgetTokens);
+    }
   }
-  /**
-   * Get current configuration
-   */
   getConfig() {
     return { ...this.config };
   }
@@ -462,6 +581,387 @@ var ToolRetryPolicy = class _ToolRetryPolicy {
     }
   }
 };
+
+// src/kernel/LoopDetector.ts
+var DEFAULT_LOOP_DETECTOR_CONFIG = {
+  exactRepeatThreshold: 4,
+  staleTodoNudgeThreshold: 6,
+  staleTodoForceStopThreshold: 10,
+  diversityThreshold: 0.5,
+  windowSize: 4
+};
+var LoopDetector = class {
+  config;
+  /** Recent turn signatures for exact repetition detection */
+  recentSignatures = [];
+  /** All unique (tool, firstParam) pairs seen in detection window */
+  uniqueCallSignatures = /* @__PURE__ */ new Set();
+  /** Total tool calls in detection window */
+  totalCallsInWindow = 0;
+  /** Serialized active todos from last turn */
+  lastActiveTodosKey = "";
+  /** Consecutive turns with unchanged active todos */
+  staleTodoTurns = 0;
+  /** Last seen completed count for progress detection */
+  lastCompletedCount = 0;
+  /** Whether agent has a plan (auto-set when 3+ todos created) */
+  hasPlan = false;
+  constructor(config) {
+    this.config = { ...DEFAULT_LOOP_DETECTOR_CONFIG, ...config };
+  }
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+  /**
+   * Record a turn's tool calls and todo state.
+   * Call after each tool execution cycle.
+   */
+  recordTurn(toolCalls, todos) {
+    const turnSignature = toolCalls.map((tc) => `${tc.name}:${JSON.stringify(tc.params)}`).sort().join("|");
+    this.recentSignatures.push(turnSignature);
+    if (this.recentSignatures.length > this.config.windowSize) {
+      this.recentSignatures.shift();
+    }
+    for (const tc of toolCalls) {
+      const firstParamValue = Object.values(tc.params)[0];
+      const key = `${tc.name}:${String(firstParamValue ?? "")}`;
+      this.uniqueCallSignatures.add(key);
+    }
+    this.totalCallsInWindow += toolCalls.length;
+    const activeTodosKey = todos.activeTodos.sort().join("|");
+    if (activeTodosKey === this.lastActiveTodosKey) {
+      if (todos.completedCount > this.lastCompletedCount) {
+        this.staleTodoTurns = 0;
+      } else {
+        this.staleTodoTurns++;
+      }
+    } else {
+      this.staleTodoTurns = 0;
+      this.lastActiveTodosKey = activeTodosKey;
+    }
+    this.lastCompletedCount = todos.completedCount;
+    if (!this.hasPlan && todos.activeTodos.length >= 3) {
+      this.hasPlan = true;
+    }
+  }
+  /**
+   * Evaluate current state — returns action recommendation.
+   */
+  evaluate() {
+    if (this.recentSignatures.length >= this.config.exactRepeatThreshold) {
+      const window2 = this.recentSignatures.slice(-this.config.exactRepeatThreshold);
+      const allSame = window2.every((s) => s === window2[0]) && window2[0] !== "";
+      if (allSame) {
+        return {
+          action: "force_stop",
+          reason: `Exact tool repetition detected: same calls repeated ${this.config.exactRepeatThreshold} turns`
+        };
+      }
+    }
+    if (this.staleTodoTurns >= this.config.staleTodoForceStopThreshold) {
+      return {
+        action: "force_stop",
+        reason: `Active tasks unchanged for ${this.staleTodoTurns} turns (force-stop threshold: ${this.config.staleTodoForceStopThreshold})`
+      };
+    }
+    if (this.staleTodoTurns >= this.config.staleTodoNudgeThreshold) {
+      if (this.isDiverse()) {
+        return { action: "continue" };
+      }
+      if (this.hasPlan && this.lastCompletedCount > 0) {
+        return { action: "continue" };
+      }
+      return {
+        action: "nudge",
+        message: this.buildNudgeMessage(),
+        staleTurns: this.staleTodoTurns
+      };
+    }
+    return { action: "continue" };
+  }
+  /**
+   * Explicitly set hasPlan flag.
+   * Also auto-set when recordTurn sees 3+ active todos.
+   */
+  setHasPlan(value) {
+    this.hasPlan = value;
+  }
+  /**
+   * Reset all state (e.g., when user sends new input).
+   */
+  reset() {
+    this.recentSignatures = [];
+    this.uniqueCallSignatures.clear();
+    this.totalCallsInWindow = 0;
+    this.lastActiveTodosKey = "";
+    this.staleTodoTurns = 0;
+    this.lastCompletedCount = 0;
+    this.hasPlan = false;
+  }
+  // ---------------------------------------------------------------------------
+  // Private
+  // ---------------------------------------------------------------------------
+  /**
+   * Calculate tool-call diversity ratio.
+   * High diversity (> threshold) means agent is doing varied work, not looping.
+   */
+  isDiverse() {
+    if (this.totalCallsInWindow === 0) return false;
+    const diversity = this.uniqueCallSignatures.size / this.totalCallsInWindow;
+    return diversity > this.config.diversityThreshold;
+  }
+  buildNudgeMessage() {
+    return `[System Reminder] You appear to be repeating actions without making progress. Your active tasks have not changed in ${this.staleTodoTurns} turns. Either:
+1. Mark your current tasks as completed with TodoWrite and present results to the user
+2. Change your approach \u2014 try different tools or queries
+3. If you have enough information, stop calling tools and respond with your findings`;
+  }
+};
+
+// src/kernel/ContextPruner.ts
+var DEFAULT_PRUNER_CONFIG = {
+  mode: "cache-ttl",
+  ttlMs: 3e5,
+  // 5 minutes
+  keepLastAssistants: 3,
+  minPrunableChars: 5e4,
+  softTrimRatio: 0.3,
+  softTrimHeadChars: 1500,
+  softTrimTailChars: 1500,
+  hardClearEnabled: true,
+  hardClearPlaceholder: "[Old tool result content cleared]"
+};
+var ContextPruner = class {
+  config;
+  /** Timestamp when each message was first seen, keyed by content hash */
+  messageTimestamps = /* @__PURE__ */ new Map();
+  constructor(config) {
+    this.config = { ...DEFAULT_PRUNER_CONFIG, ...config };
+  }
+  /**
+   * Record the current time for messages that haven't been seen before.
+   * Call this after adding messages to track their age.
+   */
+  trackMessages(messages) {
+    const now = Date.now();
+    for (const msg of messages) {
+      const key = this.messageKey(msg);
+      if (!this.messageTimestamps.has(key)) {
+        this.messageTimestamps.set(key, now);
+      }
+    }
+  }
+  /**
+   * Prune old, large tool results in-place.
+   * Returns the number of messages pruned and characters saved.
+   */
+  prune(messages, now) {
+    if (this.config.mode === "off") {
+      return { prunedCount: 0, charsSaved: 0 };
+    }
+    const currentTime = now ?? Date.now();
+    let prunedCount = 0;
+    let charsSaved = 0;
+    const protectedIndices = this.findProtectedIndices(messages);
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (protectedIndices.has(i)) continue;
+      if (msg.role !== "tool") continue;
+      if (msg.content.length < this.config.minPrunableChars) continue;
+      const key = this.messageKey(msg);
+      const timestamp = this.messageTimestamps.get(key);
+      if (!timestamp) continue;
+      const age = currentTime - timestamp;
+      if (this.config.hardClearEnabled && age > this.config.ttlMs * 2) {
+        const originalLength = msg.content.length;
+        msg.content = this.config.hardClearPlaceholder;
+        charsSaved += originalLength - msg.content.length;
+        prunedCount++;
+        continue;
+      }
+      if (age > this.config.ttlMs) {
+        const originalLength = msg.content.length;
+        msg.content = this.softTrim(msg.content, age);
+        charsSaved += originalLength - msg.content.length;
+        prunedCount++;
+      }
+    }
+    return { prunedCount, charsSaved };
+  }
+  /**
+   * Clear all tracking state.
+   */
+  reset() {
+    this.messageTimestamps.clear();
+  }
+  // ---------------------------------------------------------------------------
+  // Private
+  // ---------------------------------------------------------------------------
+  /**
+   * Find indices of protected messages (last N assistant turns and their tool results).
+   */
+  findProtectedIndices(messages) {
+    const indices = /* @__PURE__ */ new Set();
+    let assistantCount = 0;
+    for (let i = messages.length - 1; i >= 0 && assistantCount < this.config.keepLastAssistants; i--) {
+      if (messages[i].role === "assistant") {
+        indices.add(i);
+        assistantCount++;
+        for (let j = i + 1; j < messages.length; j++) {
+          if (messages[j].role === "tool") {
+            indices.add(j);
+          } else {
+            break;
+          }
+        }
+      }
+    }
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === "system") {
+        indices.add(i);
+      } else if (messages[i].role === "user" && i <= 1) {
+        indices.add(i);
+      }
+    }
+    return indices;
+  }
+  /**
+   * Soft-trim content: keep head + tail, replace middle with marker.
+   */
+  softTrim(content, ageMs) {
+    const headChars = this.config.softTrimHeadChars;
+    const tailChars = this.config.softTrimTailChars;
+    if (content.length <= headChars + tailChars) {
+      return content;
+    }
+    const head = content.slice(0, headChars);
+    const tail = content.slice(-tailChars);
+    const ageSeconds = Math.round(ageMs / 1e3);
+    return `${head}
+
+[... pruned: ${content.length} chars total, aged ${ageSeconds}s ...]
+
+${tail}`;
+  }
+  /**
+   * Create a stable key for a message based on role + toolCallId + content prefix.
+   */
+  messageKey(msg) {
+    if (msg.toolCallId) {
+      return `tool:${msg.toolCallId}`;
+    }
+    return `${msg.role}:${msg.content.slice(0, 100)}`;
+  }
+};
+
+// src/kernel/ToolResultFormatter.ts
+function formatToolResult(result) {
+  if (result.observation && result.observation.startsWith("User answered:")) {
+    return result.observation;
+  }
+  if (result.structured) {
+    return formatStructuredResult(result.structured);
+  }
+  if (result.observation) {
+    return result.observation;
+  }
+  if (result.success && result.data !== void 0 && result.data !== null) {
+    if (typeof result.data === "string") return result.data;
+    return JSON.stringify(result.data, null, 2);
+  }
+  if (result.error) {
+    return `Error: ${result.error}`;
+  }
+  if (result.success) {
+    return "Done.";
+  }
+  return "No result";
+}
+function truncateToolResult(content, maxChars) {
+  if (content.length <= maxChars) {
+    return content;
+  }
+  const headSize = Math.floor(maxChars * 0.7);
+  const tailSize = Math.min(4e3, maxChars - headSize);
+  const head = content.slice(0, headSize);
+  const tail = content.slice(-tailSize);
+  const omitted = content.length - headSize - tailSize;
+  return `${head}
+
+[... ${omitted} chars omitted (${content.length} total) ...]
+
+${tail}`;
+}
+function formatStructuredResult(s) {
+  const parts = [];
+  parts.push(`[${s.type.toUpperCase()}] ${s.summary}`);
+  if (s.fields) {
+    const scalarFields = [];
+    const objectArrayFields = [];
+    for (const [key, value] of Object.entries(s.fields)) {
+      if (Array.isArray(value) && value.length > 0 && typeof value[0] === "object" && value[0] !== null) {
+        objectArrayFields.push([key, value]);
+      } else if (Array.isArray(value) && value.length > 10) {
+        objectArrayFields.push([key, value]);
+      } else {
+        scalarFields.push([key, value]);
+      }
+    }
+    const fieldEntries = scalarFields.filter(([_key, value]) => {
+      if (typeof value === "object" && value !== null) {
+        const str = JSON.stringify(value);
+        if (str.length > 200) return false;
+      }
+      return true;
+    }).map(([key, value]) => `  ${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`);
+    if (fieldEntries.length > 0) {
+      parts.push("Fields:");
+      parts.push(...fieldEntries);
+    }
+    for (const [key, arr] of objectArrayFields) {
+      parts.push(`
+${key} (${arr.length} items):`);
+      arr.slice(0, 10).forEach((item, i) => {
+        if (typeof item === "object" && item !== null) {
+          const obj = item;
+          const idPart = obj.id ? `[id: "${obj.id}"] ` : "";
+          const label = obj.title || obj.name || (!obj.id ? JSON.stringify(item).slice(0, 80) : "");
+          const scorePart = obj.score !== void 0 ? ` (score: ${Number(obj.score).toFixed(2)})` : "";
+          const simPart = obj.similarity !== void 0 ? ` (sim: ${Number(obj.similarity).toFixed(2)})` : "";
+          parts.push(`  ${i + 1}. ${idPart}${label}${scorePart}${simPart}`);
+        } else {
+          parts.push(`  ${i + 1}. ${item}`);
+        }
+      });
+      if (arr.length > 10) {
+        parts.push(`  ... and ${arr.length - 10} more`);
+      }
+    }
+  }
+  if (s.actions && s.actions.length > 0) {
+    formatActions(parts, s.actions);
+  }
+  if (s.metadata) {
+    formatMetadata(parts, s.metadata);
+  }
+  return parts.join("\n");
+}
+function formatActions(parts, actions) {
+  parts.push("\nSuggested next steps:");
+  for (const action of actions) {
+    parts.push(`  - ${action.tool}: ${action.reason}`);
+  }
+}
+function formatMetadata(parts, metadata) {
+  const metaParts = [];
+  if (metadata.durationMs) metaParts.push(`${metadata.durationMs}ms`);
+  if (metadata.itemCount !== void 0) metaParts.push(`${metadata.itemCount} items`);
+  if (metadata.truncated) metaParts.push("truncated");
+  if (metaParts.length > 0) {
+    parts.push(`
+(${metaParts.join(", ")})`);
+  }
+}
 
 // src/kernel/ConversationStore.ts
 var log3 = createLogger("ConversationStore");
@@ -1279,6 +1779,50 @@ function repairToolMessages(messages) {
   return result;
 }
 
+// src/kernel/MemoryFlushHook.ts
+var DEFAULT_MEMORY_FLUSH_CONFIG = {
+  enabled: true,
+  softThresholdTokens: 4e3,
+  forceFlushTranscriptBytes: 2 * 1024 * 1024
+  // 2MB
+};
+var NoOpMemoryFlushHook = class {
+  config;
+  lastFlushedCompactionCount = -1;
+  constructor(config) {
+    this.config = { ...DEFAULT_MEMORY_FLUSH_CONFIG, ...config };
+  }
+  /**
+   * Check if flush should run before compaction.
+   * Returns true if conditions are met (even in no-op mode, for testing the trigger logic).
+   */
+  shouldFlush(params) {
+    if (!this.config.enabled) return false;
+    if (params.compactionCount <= this.lastFlushedCompactionCount) return false;
+    const tokensRemaining = params.tokenBudget - params.estimatedTokens;
+    if (tokensRemaining <= this.config.softThresholdTokens) {
+      return true;
+    }
+    if (params.transcriptByteEstimate >= this.config.forceFlushTranscriptBytes) {
+      return true;
+    }
+    return false;
+  }
+  /**
+   * No-op flush — Phase 4 provides real implementation.
+   */
+  async flush(_params) {
+    return false;
+  }
+  /**
+   * Record that a flush was attempted for the given compaction count.
+   * Prevents re-triggering for the same cycle.
+   */
+  recordFlush(compactionCount) {
+    this.lastFlushedCompactionCount = compactionCount;
+  }
+};
+
 // src/kernel/ConversationEngine.ts
 var log5 = createLogger("ConversationEngine");
 var DEFAULT_CONFIG4 = {
@@ -1374,7 +1918,7 @@ var SUBAGENT_TOOL_DEFINITIONS = [
     category: "agent"
   }
 ];
-var ConversationEngine = class _ConversationEngine {
+var ConversationEngine = class {
   llm;
   tools;
   ui;
@@ -1414,19 +1958,13 @@ var ConversationEngine = class _ConversationEngine {
   taskSpawner = null;
   // Base system prompt (immutable) — state is appended dynamically each turn
   baseSystemPrompt = "";
-  // Loop detection state
-  recentToolSignatures = [];
-  // Tool call signatures per turn (last N turns)
-  lastActiveTodosSnapshot = "";
-  // Serialized active todos for stale detection
-  staleTodoTurns = 0;
-  // Consecutive turns with unchanged active todos
-  static LOOP_DETECTION_WINDOW = 4;
-  // Check last N turns for repetition
-  static STALE_TODO_THRESHOLD = 3;
-  // Nudge after N stale turns
-  static STALE_TODO_FORCE_STOP = 6;
-  // Force-stop after N stale turns
+  // Loop detection — extracted to LoopDetector (Phase 3)
+  loopDetector;
+  // Context pruning — cache-TTL pruning of old tool results (Phase 3)
+  contextPruner;
+  // Memory flush — flush-before-discard pattern (Phase 4)
+  memoryFlushHook;
+  compactionCount = 0;
   constructor(deps) {
     this.llm = deps.llm;
     this.tools = deps.tools;
@@ -1434,9 +1972,12 @@ var ConversationEngine = class _ConversationEngine {
     this.events = deps.events;
     this.taskSpawner = deps.taskSpawner ?? null;
     this.contextCompressor = new ContextCompressor(this.llm);
+    this.loopDetector = new LoopDetector();
+    this.contextPruner = new ContextPruner();
     this.retryPolicy = new ToolRetryPolicy();
     this.store = conversationStore;
     this.decisionLogger = new DecisionLogger();
+    this.memoryFlushHook = deps.memoryFlushHook ?? new NoOpMemoryFlushHook();
   }
   /**
    * Attach a debug harness for structured trace logging and step-mode.
@@ -1451,6 +1992,64 @@ var ConversationEngine = class _ConversationEngine {
   // ===========================================================================
   // PUBLIC API
   // ===========================================================================
+  /**
+   * Continue an existing conversation with a new user message.
+   * Appends to existing history instead of resetting.
+   * Uses the same conversationId and preserves all state.
+   */
+  async continueConversation(prompt, config) {
+    if (this.history.length === 0 || !this.conversationId) {
+      return this.execute(prompt, config);
+    }
+    log5.info("Continuing conversation", {
+      conversationId: this.conversationId,
+      historyLength: this.history.length,
+      promptLength: prompt.length
+    });
+    if (this.isRunning()) {
+      log5.warn("Conversation already running");
+      return this.createResult(false, "Conversation already running", 0);
+    }
+    const cfg = {
+      ...DEFAULT_CONFIG4,
+      ...this.lastConfig ?? {},
+      ...config?.maxTurns !== void 0 ? { maxTurns: config.maxTurns } : {},
+      ...config?.timeoutMs !== void 0 ? { timeoutMs: config.timeoutMs } : {},
+      ...config?.maxTokensPerTurn !== void 0 ? { maxTokensPerTurn: config.maxTokensPerTurn } : {},
+      ...config?.requireTodoWrite !== void 0 ? { requireTodoWrite: config.requireTodoWrite } : {},
+      ...config?.parallelTools !== void 0 ? { parallelTools: config.parallelTools } : {},
+      ...config?.visibleTools !== void 0 ? { visibleTools: config.visibleTools } : {},
+      ...config?.resultMaxChars !== void 0 ? { resultMaxChars: config.resultMaxChars } : {}
+    };
+    this.lastConfig = cfg;
+    this.status = "running";
+    this.abortController = new AbortController();
+    if (config?.systemPrompt && config.systemPrompt !== this.baseSystemPrompt) {
+      this.baseSystemPrompt = config.systemPrompt;
+      if (this.history.length > 0 && this.history[0].role === "system") {
+        this.history[0] = { role: "system", content: config.systemPrompt };
+      }
+    }
+    this.history.push({ role: "user", content: prompt });
+    const startTime = Date.now();
+    await this.events.emit("conversation:turn", {
+      turn: this.currentTurn,
+      message: { role: "user", content: prompt }
+    });
+    try {
+      return await this.runLoop(cfg, startTime);
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      log5.error("Continue conversation error", { error: errMsg });
+      return this.createResult(false, errMsg, Date.now() - startTime, "failed");
+    }
+  }
+  /**
+   * Check if this engine has an active conversation (history exists).
+   */
+  hasActiveConversation() {
+    return this.history.length > 0 && !!this.conversationId;
+  }
   /**
    * Execute a conversation with the given prompt
    */
@@ -1517,6 +2116,8 @@ var ConversationEngine = class _ConversationEngine {
     this.outputPaths = [];
     this.hasProducedOutput = false;
     this.decisionLogger.clear();
+    this.loopDetector.reset();
+    this.contextPruner.reset();
     if (config?.retry) {
       this.retryPolicy.updateConfig(config.retry);
     }
@@ -1611,12 +2212,6 @@ var ConversationEngine = class _ConversationEngine {
         if (this.currentTodos.length > 0) {
           const activeTodos = this.currentTodos.filter((t) => t.status !== "completed").map((t) => `- [${t.status}] ${t.content}`).join("\n");
           if (activeTodos) {
-            if (activeTodos === this.lastActiveTodosSnapshot) {
-              this.staleTodoTurns++;
-            } else {
-              this.staleTodoTurns = 0;
-              this.lastActiveTodosSnapshot = activeTodos;
-            }
             stateParts.push(`Active Tasks:
 ${activeTodos}`);
           }
@@ -1665,6 +2260,36 @@ ${activeTodos}`);
         log5.debug("Available Tools:", { count: toolsList.length, tools: toolsList.map((t) => t.name) });
         log5.debug("Full Prompt:", { history: this.history });
         log5.debug("=".repeat(80));
+        try {
+          const transcriptByteEstimate = this.history.reduce(
+            (sum, m) => sum + (m.content?.length ?? 0),
+            0
+          );
+          const estimatedTokens = Math.ceil(transcriptByteEstimate / 4);
+          const tokenBudget = config.compression?.maxTokens ?? 1e5;
+          if (this.memoryFlushHook.shouldFlush({
+            estimatedTokens,
+            tokenBudget,
+            transcriptByteEstimate,
+            compactionCount: this.compactionCount
+          })) {
+            log5.info("Memory flush triggered before compaction", {
+              compactionCount: this.compactionCount,
+              estimatedTokens,
+              tokenBudget
+            });
+            const flushed = await this.memoryFlushHook.flush({
+              messages: this.history,
+              signal: this.abortController?.signal ?? new AbortController().signal
+            });
+            if (flushed) {
+              this.memoryFlushHook.recordFlush(this.compactionCount);
+              log5.info("Memory flush completed", { compactionCount: this.compactionCount });
+            }
+          }
+        } catch (error) {
+          log5.warn("Memory flush failed, proceeding with compaction", { error });
+        }
         let messagesToSend = this.history;
         if (config.compression) {
           this.contextCompressor.updateConfig(config.compression);
@@ -1675,10 +2300,12 @@ ${activeTodos}`);
         );
         if (compressionResult.wasCompressed) {
           messagesToSend = compressionResult.messages;
+          this.compactionCount++;
           log5.info("Context compressed before LLM call", {
             originalTokens: compressionResult.originalTokens,
             compressedTokens: compressionResult.compressedTokens,
-            summarizedTurns: compressionResult.summarizedTurns
+            summarizedTurns: compressionResult.summarizedTurns,
+            compactionCount: this.compactionCount
           });
         }
         messagesToSend = repairToolMessages(messagesToSend);
@@ -1787,6 +2414,7 @@ ${activeTodos}`);
         );
         if (hasTodoWrite) {
           this.hasPlan = true;
+          this.loopDetector.setHasPlan(true);
           log5.info("TodoWrite called - plan established", { turn: this.currentTurn });
           this.debugHarness?.trace("todowrite-gate", "plan-established", {
             turn: this.currentTurn
@@ -1829,7 +2457,7 @@ ${activeTodos}`);
             for (const toolCall of actionTools) {
               this.history.push({
                 role: "tool",
-                content: `Tool call blocked: You must call TodoWrite first to create a task plan before using "${toolCall.name}". However, clarification tools (like agent_ask_user) and query tools are allowed without a plan.`,
+                content: `Tool call blocked: Call TodoWrite FIRST to create a plan, then retry "${toolCall.name}". Example: TodoWrite({todos: [{content: "Step description", status: "in_progress", activeForm: "Doing step"}]}). You can combine TodoWrite with "${toolCall.name}" in the same turn using batch_tools.`,
                 toolCallId: toolCall.id,
                 toolName: toolCall.name
               });
@@ -1840,7 +2468,7 @@ ${activeTodos}`);
               await this.events.emit("conversation:tool-result", { toolCall, result });
               this.history.push({
                 role: "tool",
-                content: this.truncateToolResult(this.formatToolResult(result), this.lastConfig?.resultMaxChars ?? 1e5),
+                content: truncateToolResult(formatToolResult(result), this.lastConfig?.resultMaxChars ?? 1e5),
                 toolCallId: toolCall.id,
                 toolName: toolCall.name
               });
@@ -2005,7 +2633,7 @@ ${activeTodos}`);
         if (entry) {
           this.history.push({
             role: "tool",
-            content: this.truncateToolResult(this.formatToolResult(entry.result), this.lastConfig?.resultMaxChars ?? 1e5),
+            content: truncateToolResult(formatToolResult(entry.result), this.lastConfig?.resultMaxChars ?? 1e5),
             toolCallId: tc.id,
             toolName: tc.name
           });
@@ -2018,42 +2646,51 @@ ${activeTodos}`);
           });
         }
       }
-      const loopAction = this.detectLoop(response.toolCalls ?? []);
-      if (loopAction === "force-stop") {
+      const todoSnapshot = {
+        activeTodos: this.currentTodos.filter((t) => t.status !== "completed").map((t) => t.content),
+        completedCount: this.currentTodos.filter((t) => t.status === "completed").length
+      };
+      this.loopDetector.recordTurn(
+        (response.toolCalls ?? []).map((tc) => ({ name: tc.name, params: tc.params })),
+        todoSnapshot
+      );
+      const loopResult = this.loopDetector.evaluate();
+      if (loopResult.action === "force_stop") {
         log5.warn("Loop detected \u2014 force-stopping conversation", {
           turn: this.currentTurn,
-          staleTodoTurns: this.staleTodoTurns,
-          recentSignatures: this.recentToolSignatures
+          reason: loopResult.reason
         });
         this.debugHarness?.trace("termination", "loop-detected-force-stop", {
           turn: this.currentTurn,
-          staleTodoTurns: this.staleTodoTurns,
-          recentSignatures: this.recentToolSignatures
+          reason: loopResult.reason
         });
+        const forceStopMessage = "I detected that I was repeating the same actions without making progress, so I stopped. " + loopResult.reason;
+        this.history.push({ role: "assistant", content: forceStopMessage });
         this.status = "completed";
-        return this.createResult(
-          true,
-          "Conversation stopped: repeated actions detected without progress. Returning results gathered so far.",
-          Date.now() - startTime,
-          "completed"
-        );
+        const forceStopResult = this.createResult(true, void 0, Date.now() - startTime, "completed");
+        await this.events.emit("conversation:completed", { result: forceStopResult });
+        return forceStopResult;
       }
-      if (loopAction === "nudge") {
+      if (loopResult.action === "nudge") {
         log5.info("Loop detected \u2014 injecting nudge", {
           turn: this.currentTurn,
-          staleTodoTurns: this.staleTodoTurns
+          staleTurns: loopResult.staleTurns
         });
         this.debugHarness?.trace("loop-detection", "nudge-injected", {
           turn: this.currentTurn,
-          staleTodoTurns: this.staleTodoTurns,
-          recentSignatures: this.recentToolSignatures
+          staleTurns: loopResult.staleTurns
         });
         this.history.push({
           role: "user",
-          content: `[System Reminder] You appear to be repeating the same actions without making progress. Your active tasks have not changed in ${this.staleTodoTurns} turns. Either:
-1. Mark your current tasks as completed with TodoWrite and present results to the user
-2. Change your approach \u2014 try different tools or queries
-3. If you have enough information, stop calling tools and respond with your findings`
+          content: loopResult.message
+        });
+      }
+      this.contextPruner.trackMessages(this.history);
+      const pruneResult = this.contextPruner.prune(this.history);
+      if (pruneResult.prunedCount > 0) {
+        log5.info("Context pruning applied", {
+          prunedCount: pruneResult.prunedCount,
+          charsSaved: pruneResult.charsSaved
         });
       }
       this.debugHarness?.trace("turn-end", "turn-complete", {
@@ -2083,52 +2720,10 @@ ${activeTodos}`);
     return this.createResult(false, "Reached max turns limit", Date.now() - startTime, "timeout");
   }
   // ===========================================================================
-  // LOOP DETECTION
+  // LOOP DETECTION — delegated to LoopDetector (Phase 3)
   // ===========================================================================
-  /**
-   * Detect if the conversation is looping — repeating the same tool calls
-   * or making no progress on active todos.
-   *
-   * Returns:
-   * - 'none'       — no loop detected, continue normally
-   * - 'nudge'      — stale todos detected, inject a reminder to change approach
-   * - 'force-stop' — severe loop detected, stop the conversation
-   */
-  detectLoop(toolCalls) {
-    const turnSignature = toolCalls.map((tc) => `${tc.name}:${JSON.stringify(tc.params)}`).sort().join("|");
-    this.recentToolSignatures.push(turnSignature);
-    if (this.recentToolSignatures.length > _ConversationEngine.LOOP_DETECTION_WINDOW) {
-      this.recentToolSignatures.shift();
-    }
-    if (this.recentToolSignatures.length >= _ConversationEngine.LOOP_DETECTION_WINDOW) {
-      const allSame = this.recentToolSignatures.every((s) => s === this.recentToolSignatures[0]);
-      if (allSame) {
-        log5.warn("Exact tool repetition detected", {
-          window: _ConversationEngine.LOOP_DETECTION_WINDOW,
-          signature: this.recentToolSignatures[0]?.substring(0, 200)
-        });
-        return "force-stop";
-      }
-    }
-    if (this.recentToolSignatures.length >= _ConversationEngine.LOOP_DETECTION_WINDOW) {
-      const toolNames = this.recentToolSignatures.map((s) => s.split(":")[0]);
-      const allSameToolName = toolNames.every((n) => n === toolNames[0]);
-      if (allSameToolName && this.staleTodoTurns >= _ConversationEngine.STALE_TODO_THRESHOLD) {
-        log5.warn("Same tool type with stale todos", {
-          toolName: toolNames[0],
-          staleTurns: this.staleTodoTurns
-        });
-        return "force-stop";
-      }
-    }
-    if (this.staleTodoTurns >= _ConversationEngine.STALE_TODO_FORCE_STOP) {
-      return "force-stop";
-    }
-    if (this.staleTodoTurns >= _ConversationEngine.STALE_TODO_THRESHOLD) {
-      return "nudge";
-    }
-    return "none";
-  }
+  // The old detectLoop() method has been replaced by this.loopDetector
+  // which is called in the main loop after tool execution.
   // ===========================================================================
   // TOOL EXECUTION
   // ===========================================================================
@@ -2137,6 +2732,18 @@ ${activeTodos}`);
    */
   async executeTool(toolCall) {
     log5.info("Tool", { name: toolCall.name });
+    const validationError = toolCall.validationError;
+    if (validationError && toolCall.name !== "batch_tools") {
+      log5.warn("Tool input validation failed \u2014 returning structured error to model", {
+        tool: toolCall.name,
+        issueCount: validationError.issues.length
+      });
+      return {
+        success: false,
+        error: validationError.message,
+        observation: validationError.message
+      };
+    }
     if (toolCall.name === "AskUserQuestion") {
       this.debugHarness?.trace("tool-special", "ask-user-question", {
         turn: this.currentTurn,
@@ -2269,19 +2876,20 @@ ${activeTodos}`);
   async handleBatchTools(params) {
     let calls = params.calls;
     if (typeof calls === "string") {
-      try {
-        const parsed = JSON.parse(calls);
-        if (Array.isArray(parsed)) {
-          calls = parsed;
-        }
-      } catch {
+      const recovered = tryRecoverCallsArray(calls);
+      if (recovered) {
+        log5.info("Recovered batch_tools calls from malformed string", {
+          originalLength: calls.length,
+          recoveredCount: recovered.length
+        });
+        calls = recovered;
       }
     }
     if (!calls || !Array.isArray(calls)) {
       return {
         success: false,
         error: 'batch_tools requires a "calls" array',
-        observation: 'Error: batch_tools requires a "calls" array with tool call objects.'
+        observation: 'Error: batch_tools "calls" must be an ARRAY of {tool, params} objects, not a string. Pass it as a native array argument:\nbatch_tools({ calls: [ { tool: "TodoWrite", params: {...} }, { tool: "spawn_task", params: {...} } ] })'
       };
     }
     if (calls.length === 0) {
@@ -2379,7 +2987,7 @@ ${activeTodos}`);
     });
     const combinedParts = [`[BATCH] Executed ${results.length} tool(s):`];
     for (const { tool: tool2, result } of results) {
-      const formatted = this.truncateToolResult(this.formatToolResult(result), this.lastConfig?.resultMaxChars ?? 1e5);
+      const formatted = truncateToolResult(formatToolResult(result), this.lastConfig?.resultMaxChars ?? 1e5);
       combinedParts.push(`
 --- ${tool2} ---`);
       combinedParts.push(formatted);
@@ -2404,10 +3012,20 @@ ${activeTodos}`);
         observation: "Error: spawn_task is not configured. No TaskSpawner available."
       };
     }
+    const description = String(params.description || params.query || params.task || "");
+    const prompt = String(params.prompt || params.description || params.query || params.task || "");
+    const subagentType = params.subagentType || params.task_type || "explore";
+    if (!prompt.trim()) {
+      return {
+        success: false,
+        error: "Missing required parameter: prompt (or description). Provide a task description for the sub-agent.",
+        observation: 'Error: spawn_task requires a "prompt" or "description" parameter describing the task for the sub-agent.'
+      };
+    }
     const taskParams = {
-      description: String(params.description || ""),
-      prompt: String(params.prompt || ""),
-      subagentType: params.subagentType || "general-purpose",
+      description: description || prompt.slice(0, 100),
+      prompt,
+      subagentType,
       model: params.model,
       runInBackground: Boolean(params.runInBackground)
     };
@@ -2551,18 +3169,12 @@ ${typeof result.data === "string" ? result.data : JSON.stringify(result.data, nu
   // ===========================================================================
   // HELPERS
   // ===========================================================================
-  /**
-   * Format tool result for message history
-   */
-  /**
-   * Format a tool result for the LLM
-   *
-   * Priority:
-   * 1. Structured result (if available) - formatted for better LLM parsing
-   * 2. Observation string (human-readable summary)
-   * 3. JSON data fallback
-   */
-  formatToolResult(result) {
+  // formatToolResult() and truncateToolResult() have been extracted to
+  // ToolResultFormatter.ts (Phase 3, Step 8) and are imported as
+  // formatToolResultUnified / truncateToolResultUnified at the top of this file.
+  // The old implementations below are kept as deprecated references.
+  // TODO: Remove after integration is validated.
+  _deprecated_formatToolResult(result) {
     if (result.observation && result.observation.startsWith("User answered:")) {
       return result.observation;
     }
@@ -2643,7 +3255,7 @@ ${key} (${arr.length} items):`);
    * Truncate a formatted tool result if it exceeds the configured max chars.
    * Uses 70/30 head/tail strategy to preserve beginning and end context.
    */
-  truncateToolResult(content, maxChars) {
+  _deprecated_truncateToolResult(content, maxChars) {
     if (content.length <= maxChars) {
       return content;
     }
@@ -2820,6 +3432,37 @@ ${tail}`;
     this.store = store;
   }
 };
+function tryRecoverCallsArray(raw) {
+  const attempts = [];
+  attempts.push(raw);
+  let stripped = raw.trim();
+  for (let i = 0; i < 10 && stripped.length > 0; i++) {
+    stripped = stripped.replace(/[\s,]+$/g, "");
+    const trailMatch = stripped.match(/(?:\s*\])+\s*$/);
+    const trailingCloses = trailMatch ? (trailMatch[0].match(/\]/g) || []).length : 0;
+    const leadMatch = stripped.match(/^\s*(?:\[\s*)+/);
+    const leadingOpens = leadMatch ? (leadMatch[0].match(/\[/g) || []).length : 0;
+    if (trailingCloses > leadingOpens) {
+      stripped = stripped.replace(/\]\s*$/, "").replace(/[\s,]+$/g, "");
+    } else {
+      break;
+    }
+  }
+  if (stripped !== raw) attempts.push(stripped);
+  const firstBracket = raw.indexOf("[");
+  const lastBracket = raw.lastIndexOf("]");
+  if (firstBracket >= 0 && lastBracket > firstBracket) {
+    attempts.push(raw.slice(firstBracket, lastBracket + 1));
+  }
+  for (const candidate of attempts) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+    }
+  }
+  return null;
+}
 
 // src/kernel/TodoManager.ts
 var log6 = createLogger("TodoManager");
@@ -3096,20 +3739,24 @@ var AGENT_TYPE_CONFIGS = {
       // Memory (read-only)
       "memory_recall",
       "memory_search",
+      // Web research (read-only)
+      "web_search",
+      "web_fetch",
       // Utils
       "utils_merge_dedupe",
       "utils_filter",
       "utils_sort",
       "utils_format"
     ],
-    systemPromptSuffix: `You are a fast exploration sub-agent. Your job is to search, read, and analyze notes \u2014 then return your findings to the parent agent.
+    systemPromptSuffix: `You are a fast exploration sub-agent. Your job is to search, read, and analyze information \u2014 then return your findings to the parent agent.
 
 RULES:
 - Do NOT ask the user questions. You cannot interact with the user.
 - Do NOT create, update, or delete notes.
 - Do NOT use TodoWrite \u2014 just do your work and return results.
-- Use search_fulltext, search_vector, or search_hybrid to find notes.
+- Use search_fulltext, search_vector, or search_hybrid to find notes in the vault.
 - Use vault_read_note to read note content (always use the UUID from search results).
+- Use web_search and web_fetch when the topic isn't in the vault (current events, external data, travel, products, etc.). After 1 failed vault search, switch to web.
 - Be concise \u2014 return structured findings, not verbose explanations.
 - Complete your task in as few turns as possible.`
   },
@@ -3141,19 +3788,22 @@ RULES:
       "llm_analyze",
       "memory_recall",
       "memory_search",
+      "web_search",
+      "web_fetch",
       "utils_merge_dedupe",
       "utils_filter",
       "utils_sort",
       "utils_format"
     ],
-    systemPromptSuffix: `You are a fast exploration sub-agent. Your job is to search, read, and analyze notes \u2014 then return your findings to the parent agent.
+    systemPromptSuffix: `You are a fast exploration sub-agent. Your job is to search, read, and analyze information \u2014 then return your findings to the parent agent.
 
 RULES:
 - Do NOT ask the user questions. You cannot interact with the user.
 - Do NOT create, update, or delete notes.
 - Do NOT use TodoWrite \u2014 just do your work and return results.
-- Use search_fulltext, search_vector, or search_hybrid to find notes.
+- Use search_fulltext, search_vector, or search_hybrid to find notes in the vault.
 - Use vault_read_note to read note content (always use the UUID from search results).
+- Use web_search and web_fetch when the topic isn't in the vault (current events, external data, travel, products, etc.). After 1 failed vault search, switch to web.
 - Be concise \u2014 return structured findings, not verbose explanations.
 - Complete your task in as few turns as possible.`
   },
@@ -4652,7 +5302,10 @@ var AIOSService = class {
    */
   async execute(prompt, config) {
     const toolProvider = config?.toolPatterns?.length && this.providers.createFilteredToolProvider ? this.providers.createFilteredToolProvider(config.toolPatterns) : this.toolProvider;
-    this.conversationEngine = this.createConversationEngine(toolProvider);
+    const canContinue = this.conversationEngine?.hasActiveConversation() && !this.conversationEngine.isRunning();
+    if (!canContinue) {
+      this.conversationEngine = this.createConversationEngine(toolProvider);
+    }
     const mergedConfig = {};
     if (this.config.systemPrompt !== void 0) {
       mergedConfig.systemPrompt = this.config.systemPrompt;
@@ -4692,29 +5345,14 @@ var AIOSService = class {
     if (this.config.requireTodoWrite !== void 0 && mergedConfig.requireTodoWrite === void 0) {
       mergedConfig.requireTodoWrite = this.config.requireTodoWrite;
     }
-    const enableMemoryContext = this.config.enableMemoryContext !== false;
-    if (enableMemoryContext && this.providers.getMemoryContext && this.providers.buildEnhancedSystemPrompt) {
+    if (this.providers.buildEnhancedSystemPrompt) {
       try {
-        log9.info("Fetching memory context for conversation");
-        const memoryContext = await this.providers.getMemoryContext(
-          [{ role: "user", content: prompt }],
-          {
-            maxMemories: this.config.maxMemories ?? 5,
-            includeProfile: this.config.includeProfile !== false
-          }
+        mergedConfig.systemPrompt = await this.providers.buildEnhancedSystemPrompt(
+          mergedConfig.systemPrompt || "",
+          { memories: [], success: true },
+          // empty memory context — on-demand via tools
+          prompt
         );
-        if (memoryContext.success) {
-          const basePrompt = mergedConfig.systemPrompt || "";
-          mergedConfig.systemPrompt = await this.providers.buildEnhancedSystemPrompt(
-            basePrompt,
-            memoryContext,
-            prompt
-          );
-          log9.info("Enhanced system prompt built", {
-            memoryCount: memoryContext.memories.length,
-            hasProfile: !!memoryContext.userProfile
-          });
-        }
       } catch (error) {
         log9.warn("Failed to build enhanced system prompt", { error });
       }
@@ -4734,8 +5372,17 @@ var AIOSService = class {
       window.__aiosDebug = harness.getConsoleAPI();
       log9.info("Debug harness attached", { tracePath: harness.getConsoleAPI().getTracePath() });
     }
-    const result = await this.conversationEngine.execute(prompt, mergedConfig);
+    const engine = this.conversationEngine;
+    const result = canContinue ? await engine.continueConversation(prompt, mergedConfig) : await engine.execute(prompt, mergedConfig);
     return result;
+  }
+  /**
+   * Reset the conversation engine so the next execute() starts fresh.
+   * Call this when the user clicks "New Chat" or equivalent.
+   */
+  newConversation() {
+    this.conversationEngine = null;
+    log9.info("Conversation engine reset \u2014 next execute() will start fresh");
   }
   /**
    * Cancel the current conversation
@@ -4817,7 +5464,8 @@ var AIOSService = class {
       ui: this.providers.getUserInterface(),
       events: this.providers.getEventEmitter(),
       classifierLlm,
-      taskSpawner: this.taskSpawner
+      taskSpawner: this.taskSpawner,
+      memoryFlushHook: this.providers.getMemoryFlushHook?.()
     };
     return new ConversationEngine(deps);
   }
@@ -4920,6 +5568,6 @@ async function invoke(command, args) {
   return currentBackend.invoke(command, args);
 }
 
-export { AIOSService, ContextCompressor, ConversationEngine, ConversationStore, DebugHarness, DecisionLogger, PlanManager, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, TaskSpawner, TodoManager, ToolRetryPolicy, VercelAILLMProvider, VerificationEngine, absorbPendingConfig, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getToolMetadata, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
+export { AIOSService, ContextCompressor, ConversationEngine, ConversationStore, DebugHarness, DecisionLogger, NoOpMemoryFlushHook, PlanManager, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, TaskSpawner, TodoManager, ToolRetryPolicy, VercelAILLMProvider, VerificationEngine, absorbPendingConfig, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getToolMetadata, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
 //# sourceMappingURL=index.mjs.map
 //# sourceMappingURL=index.mjs.map

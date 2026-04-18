@@ -610,4 +610,153 @@ describe('batch_tools', () => {
       expect(mockLLM.chat).toHaveBeenCalledTimes(2);
     });
   });
+
+  // ===========================================================================
+  // PARALLEL EXECUTION WITHIN BATCH
+  // ===========================================================================
+
+  describe('Parallel Execution within Batch', () => {
+    it('should execute parallel-safe sub-calls concurrently', async () => {
+      const executionLog: string[] = [];
+      const DELAY = 50;
+
+      mockLLM = createMockLLM([
+        {
+          content: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'tc1',
+              name: 'batch_tools',
+              params: {
+                calls: [
+                  { tool: 'search_fulltext', params: { query: 'a' } },
+                  { tool: 'search_vector', params: { query: 'b' } },
+                  { tool: 'Grep', params: { pattern: 'c' } },
+                ],
+              },
+            },
+          ],
+        },
+        { content: 'Done', finishReason: 'stop' },
+      ]);
+
+      mockTools = createMockToolProvider({
+        search_fulltext: async () => {
+          executionLog.push('search_fulltext:start');
+          await new Promise(r => setTimeout(r, DELAY));
+          executionLog.push('search_fulltext:end');
+          return { success: true, observation: 'Results a' };
+        },
+        search_vector: async () => {
+          executionLog.push('search_vector:start');
+          await new Promise(r => setTimeout(r, DELAY));
+          executionLog.push('search_vector:end');
+          return { success: true, observation: 'Results b' };
+        },
+        Grep: async () => {
+          executionLog.push('Grep:start');
+          await new Promise(r => setTimeout(r, DELAY));
+          executionLog.push('Grep:end');
+          return { success: true, observation: 'Results c' };
+        },
+      });
+      mockUI = createMockUI();
+
+      engine = new ConversationEngine({
+        llm: mockLLM,
+        tools: mockTools,
+        ui: mockUI,
+        events: mockEvents,
+      });
+
+      const start = Date.now();
+      const result = await engine.execute('Batch search', {
+        requireTodoWrite: false,
+      });
+      const elapsed = Date.now() - start;
+
+      expect(result.success).toBe(true);
+
+      // All three should start before any ends (concurrent execution)
+      const startIndices = executionLog
+        .filter(e => e.endsWith(':start'))
+        .map(e => executionLog.indexOf(e));
+      const endIndices = executionLog
+        .filter(e => e.endsWith(':end'))
+        .map(e => executionLog.indexOf(e));
+
+      expect(Math.max(...startIndices)).toBeLessThan(Math.min(...endIndices));
+
+      // Should be roughly 1x delay, not 3x
+      expect(elapsed).toBeLessThan(DELAY * 2.5);
+    });
+
+    it('should handle mixed parallel + sequential sub-calls in batch', async () => {
+      const executionOrder: string[] = [];
+
+      mockLLM = createMockLLM([
+        {
+          content: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'tc1',
+              name: 'batch_tools',
+              params: {
+                calls: [
+                  { tool: 'search_fulltext', params: { query: 'a' } },
+                  { tool: 'Grep', params: { pattern: 'b' } },
+                  { tool: 'vault_create_note', params: { title: 'New' } },
+                ],
+              },
+            },
+          ],
+        },
+        { content: 'Done', finishReason: 'stop' },
+      ]);
+
+      mockTools = createMockToolProvider({
+        search_fulltext: async () => {
+          executionOrder.push('search_fulltext');
+          return { success: true, observation: 'Results' };
+        },
+        Grep: async () => {
+          executionOrder.push('Grep');
+          return { success: true, observation: 'Matches' };
+        },
+        vault_create_note: async () => {
+          executionOrder.push('vault_create_note');
+          return { success: true, observation: 'Created' };
+        },
+      });
+      mockUI = createMockUI();
+
+      engine = new ConversationEngine({
+        llm: mockLLM,
+        tools: mockTools,
+        ui: mockUI,
+        events: mockEvents,
+      });
+
+      const result = await engine.execute('Mixed batch', {
+        requireTodoWrite: false,
+      });
+
+      expect(result.success).toBe(true);
+
+      // vault_create_note (sequential) must be last
+      expect(executionOrder[executionOrder.length - 1]).toBe('vault_create_note');
+
+      // The batch result should contain all 3 tool results
+      const llmCalls = (mockLLM.chat as ReturnType<typeof vi.fn>).mock.calls;
+      const secondCallMessages = llmCalls[1][0] as Array<{ role: string; content?: string }>;
+      const toolMessages = secondCallMessages.filter(m => m.role === 'tool');
+      // batch_tools returns a single combined result
+      expect(toolMessages).toHaveLength(1);
+      expect(toolMessages[0].content).toContain('[BATCH]');
+      expect(toolMessages[0].content).toContain('search_fulltext');
+      expect(toolMessages[0].content).toContain('vault_create_note');
+    });
+  });
 });

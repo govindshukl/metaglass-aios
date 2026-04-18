@@ -151,14 +151,7 @@ export class TodoManager {
       }
     }
 
-    // Validate: only one in_progress
-    const inProgress = todos.filter(t => t.status === 'in_progress');
-    if (inProgress.length > 1) {
-      return {
-        success: false,
-        error: 'Only one task can be in_progress at a time',
-      };
-    }
+    // Multiple in_progress tasks are allowed for parallel work.
 
     // Detect status changes for events
     const previousTodos = this.todos;

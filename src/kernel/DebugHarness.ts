@@ -32,6 +32,7 @@ export type TracePhase =
   | 'todowrite-gate'    // Enforcement: has plan? exempt? blocked?
   | 'tool-exec'         // Per-tool: name, params, result
   | 'tool-special'      // TodoWrite, AskUserQuestion
+  | 'loop-detection'    // Loop/stale-todo nudge or force-stop
   | 'error'             // Caught exception, retry decision, fallback
   | 'turn-end'          // Turn summary, checkpoint
   | 'completion'        // Natural stop, goal session save

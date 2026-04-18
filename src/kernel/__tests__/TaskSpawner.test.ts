@@ -640,4 +640,107 @@ describe('TaskSpawner', () => {
       expect(result.error).toBe('Task failed');
     });
   });
+
+  // ===========================================================================
+  // DEPTH AND CONCURRENCY LIMITS
+  // ===========================================================================
+
+  describe('Depth Limiting', () => {
+    it('should reject when max depth is exceeded', async () => {
+      const deepSpawner = new TaskSpawner(mockAgentFactory, mockEvents, 3, 3);
+
+      const result = await deepSpawner.spawn({
+        description: 'Too deep',
+        prompt: 'Should fail',
+        subagentType: 'explore',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Maximum agent nesting depth exceeded');
+      expect(result.status).toBe('failed');
+      expect(mockAgentFactory.create).not.toHaveBeenCalled();
+    });
+
+    it('should allow spawning when under depth limit', async () => {
+      const shallowSpawner = new TaskSpawner(mockAgentFactory, mockEvents, 1, 3);
+
+      const result = await shallowSpawner.spawn({
+        description: 'Shallow enough',
+        prompt: 'Should work',
+        subagentType: 'explore',
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should pass incremented depth to agent config', async () => {
+      const spawnerAtDepth1 = new TaskSpawner(mockAgentFactory, mockEvents, 1, 3);
+
+      await spawnerAtDepth1.spawn({
+        description: 'Test depth',
+        prompt: 'Check config',
+        subagentType: 'execute',
+      });
+
+      expect(mockAgentFactory.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          depth: 2,
+        })
+      );
+    });
+  });
+
+  describe('Concurrency Limiting', () => {
+    it('should reject when max concurrent tasks are reached', async () => {
+      // Create factory that returns agents that stay "running"
+      const runningFactory: AgentFactory = {
+        create: vi.fn(() => ({
+          execute: vi.fn(() => new Promise(() => {})), // Never resolves
+          cancel: vi.fn(),
+          isRunning: vi.fn(() => true),
+        })),
+      };
+      const limitedSpawner = new TaskSpawner(runningFactory, mockEvents, 0, 3, 2);
+
+      // Spawn 2 background tasks (maxConcurrent = 2)
+      await limitedSpawner.spawn({
+        description: 'Task 1',
+        prompt: 'First',
+        subagentType: 'explore',
+        runInBackground: true,
+      });
+      await limitedSpawner.spawn({
+        description: 'Task 2',
+        prompt: 'Second',
+        subagentType: 'explore',
+        runInBackground: true,
+      });
+
+      // Third should be rejected
+      const result = await limitedSpawner.spawn({
+        description: 'Task 3',
+        prompt: 'Third',
+        subagentType: 'explore',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Maximum concurrent sub-agents reached');
+    });
+  });
+
+  describe('Constructor Defaults', () => {
+    it('should default to depth 0, maxDepth 3, maxConcurrent 5', () => {
+      const defaultSpawner = new TaskSpawner(mockAgentFactory, mockEvents);
+      expect(defaultSpawner.depth).toBe(0);
+      expect(defaultSpawner.maxDepth).toBe(3);
+      expect(defaultSpawner.maxConcurrent).toBe(5);
+    });
+
+    it('should accept custom depth, maxDepth, and maxConcurrent', () => {
+      const customSpawner = new TaskSpawner(mockAgentFactory, mockEvents, 2, 5, 10);
+      expect(customSpawner.depth).toBe(2);
+      expect(customSpawner.maxDepth).toBe(5);
+      expect(customSpawner.maxConcurrent).toBe(10);
+    });
+  });
 });

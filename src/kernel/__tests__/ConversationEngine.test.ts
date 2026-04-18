@@ -1040,5 +1040,459 @@ describe('ConversationEngine', () => {
     });
   });
 
+  // ===========================================================================
+  // PARALLEL TOOL EXECUTION
+  // ===========================================================================
+
+  describe('Parallel Tool Execution', () => {
+    it('should execute parallel-safe tools concurrently', async () => {
+      const executionLog: string[] = [];
+      const DELAY = 50; // ms
+
+      mockLLM = createMockLLM([
+        {
+          content: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            { id: 'tc1', name: 'search_fulltext', params: { query: 'a' } },
+            { id: 'tc2', name: 'search_vector', params: { query: 'b' } },
+            { id: 'tc3', name: 'Grep', params: { pattern: 'c' } },
+          ],
+        },
+        { content: 'Done searching', finishReason: 'stop' },
+      ]);
+
+      mockTools = createMockToolProvider({
+        search_fulltext: async () => {
+          executionLog.push('search_fulltext:start');
+          await new Promise(r => setTimeout(r, DELAY));
+          executionLog.push('search_fulltext:end');
+          return { success: true, observation: 'Results for a' };
+        },
+        search_vector: async () => {
+          executionLog.push('search_vector:start');
+          await new Promise(r => setTimeout(r, DELAY));
+          executionLog.push('search_vector:end');
+          return { success: true, observation: 'Results for b' };
+        },
+        Grep: async () => {
+          executionLog.push('Grep:start');
+          await new Promise(r => setTimeout(r, DELAY));
+          executionLog.push('Grep:end');
+          return { success: true, observation: 'Results for c' };
+        },
+      });
+      mockUI = createMockUI();
+
+      engine = new ConversationEngine({
+        llm: mockLLM,
+        tools: mockTools,
+        ui: mockUI,
+        events: mockEvents,
+      });
+
+      const start = Date.now();
+      const result = await engine.execute('Search for a, b, and c', {
+        requireTodoWrite: false,
+        parallelTools: true,
+      });
+      const elapsed = Date.now() - start;
+
+      expect(result.success).toBe(true);
+
+      // All three should start before any ends (concurrent execution)
+      const startIndices = executionLog
+        .filter(e => e.endsWith(':start'))
+        .map(e => executionLog.indexOf(e));
+      const endIndices = executionLog
+        .filter(e => e.endsWith(':end'))
+        .map(e => executionLog.indexOf(e));
+
+      // All starts should come before any end (concurrent)
+      expect(Math.max(...startIndices)).toBeLessThan(Math.min(...endIndices));
+
+      // Elapsed time should be roughly 1x delay, not 3x
+      // Use generous margin to avoid flakiness
+      expect(elapsed).toBeLessThan(DELAY * 2.5);
+    });
+
+    it('should keep sequential tools in order', async () => {
+      const executionOrder: string[] = [];
+
+      mockLLM = createMockLLM([
+        {
+          content: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            { id: 'tc1', name: 'vault_create_note', params: { title: 'Note 1' } },
+            { id: 'tc2', name: 'vault_update_note', params: { id: '1' } },
+          ],
+        },
+        { content: 'Done', finishReason: 'stop' },
+      ]);
+
+      mockTools = createMockToolProvider({
+        vault_create_note: async () => {
+          executionOrder.push('vault_create_note');
+          return { success: true, observation: 'Created' };
+        },
+        vault_update_note: async () => {
+          executionOrder.push('vault_update_note');
+          return { success: true, observation: 'Updated' };
+        },
+      });
+      mockUI = createMockUI();
+
+      engine = new ConversationEngine({
+        llm: mockLLM,
+        tools: mockTools,
+        ui: mockUI,
+        events: mockEvents,
+      });
+
+      const result = await engine.execute('Create and update notes', {
+        requireTodoWrite: false,
+      });
+
+      expect(result.success).toBe(true);
+      expect(executionOrder).toEqual(['vault_create_note', 'vault_update_note']);
+    });
+
+    it('should handle mixed parallel + sequential tool calls', async () => {
+      const executionLog: string[] = [];
+
+      mockLLM = createMockLLM([
+        {
+          content: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            { id: 'tc1', name: 'Read', params: { path: '/a' } },
+            { id: 'tc2', name: 'Grep', params: { pattern: 'x' } },
+            { id: 'tc3', name: 'vault_create_note', params: { title: 'New' } },
+          ],
+        },
+        { content: 'Done', finishReason: 'stop' },
+      ]);
+
+      mockTools = createMockToolProvider({
+        Read: async () => {
+          executionLog.push('Read');
+          await new Promise(r => setTimeout(r, 30));
+          return { success: true, observation: 'File content' };
+        },
+        Grep: async () => {
+          executionLog.push('Grep');
+          await new Promise(r => setTimeout(r, 30));
+          return { success: true, observation: 'Matches' };
+        },
+        vault_create_note: async () => {
+          executionLog.push('vault_create_note');
+          return { success: true, observation: 'Created' };
+        },
+      });
+      mockUI = createMockUI();
+
+      engine = new ConversationEngine({
+        llm: mockLLM,
+        tools: mockTools,
+        ui: mockUI,
+        events: mockEvents,
+      });
+
+      const result = await engine.execute('Read, grep, then create', {
+        requireTodoWrite: false,
+      });
+
+      expect(result.success).toBe(true);
+
+      // vault_create_note (sequential) must come after Read and Grep (parallel)
+      const createIndex = executionLog.indexOf('vault_create_note');
+      expect(createIndex).toBe(2); // Last to execute
+
+      // Verify history order matches original toolCall order
+      const llmCalls = (mockLLM.chat as ReturnType<typeof vi.fn>).mock.calls;
+      const secondCallMessages = llmCalls[1][0] as Array<{ role: string; toolName?: string }>;
+      const toolMessages = secondCallMessages.filter(m => m.role === 'tool');
+      expect(toolMessages.map(m => m.toolName)).toEqual(['Read', 'Grep', 'vault_create_note']);
+    });
+
+    it('should isolate parallel tool failures', async () => {
+      mockLLM = createMockLLM([
+        {
+          content: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            { id: 'tc1', name: 'search_fulltext', params: { query: 'fail' } },
+            { id: 'tc2', name: 'Grep', params: { pattern: 'ok' } },
+          ],
+        },
+        { content: 'Handled errors', finishReason: 'stop' },
+      ]);
+
+      mockTools = createMockToolProvider({
+        search_fulltext: async () => {
+          return { success: false, error: 'Search failed', observation: 'Error: Search failed' };
+        },
+        Grep: async () => {
+          return { success: true, observation: 'Found matches' };
+        },
+      });
+      mockUI = createMockUI();
+
+      engine = new ConversationEngine({
+        llm: mockLLM,
+        tools: mockTools,
+        ui: mockUI,
+        events: mockEvents,
+      });
+
+      const result = await engine.execute('Search and grep', {
+        requireTodoWrite: false,
+      });
+
+      expect(result.success).toBe(true);
+
+      // Both results should be in history
+      const llmCalls = (mockLLM.chat as ReturnType<typeof vi.fn>).mock.calls;
+      const secondCallMessages = llmCalls[1][0] as Array<{ role: string; toolName?: string; content?: string }>;
+      const toolMessages = secondCallMessages.filter(m => m.role === 'tool');
+      expect(toolMessages).toHaveLength(2);
+      expect(toolMessages[0].toolName).toBe('search_fulltext');
+      expect(toolMessages[1].toolName).toBe('Grep');
+    });
+
+    it('should disable parallel execution when parallelTools is false', async () => {
+      const executionOrder: string[] = [];
+
+      mockLLM = createMockLLM([
+        {
+          content: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            { id: 'tc1', name: 'search_fulltext', params: { query: 'a' } },
+            { id: 'tc2', name: 'Grep', params: { pattern: 'b' } },
+          ],
+        },
+        { content: 'Done', finishReason: 'stop' },
+      ]);
+
+      mockTools = createMockToolProvider({
+        search_fulltext: async () => {
+          executionOrder.push('search_fulltext');
+          return { success: true, observation: 'Results' };
+        },
+        Grep: async () => {
+          executionOrder.push('Grep');
+          return { success: true, observation: 'Matches' };
+        },
+      });
+      mockUI = createMockUI();
+
+      engine = new ConversationEngine({
+        llm: mockLLM,
+        tools: mockTools,
+        ui: mockUI,
+        events: mockEvents,
+      });
+
+      const result = await engine.execute('Search and grep', {
+        requireTodoWrite: false,
+        parallelTools: false,
+      });
+
+      expect(result.success).toBe(true);
+      // Sequential execution: order is deterministic
+      expect(executionOrder).toEqual(['search_fulltext', 'Grep']);
+    });
+
+    it('should skip partitioning for single tool calls', async () => {
+      mockLLM = createMockLLM([
+        {
+          content: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            { id: 'tc1', name: 'search_fulltext', params: { query: 'a' } },
+          ],
+        },
+        { content: 'Found it', finishReason: 'stop' },
+      ]);
+
+      mockTools = createMockToolProvider({
+        search_fulltext: async () => {
+          return { success: true, observation: 'Results for a' };
+        },
+      });
+      mockUI = createMockUI();
+
+      engine = new ConversationEngine({
+        llm: mockLLM,
+        tools: mockTools,
+        ui: mockUI,
+        events: mockEvents,
+      });
+
+      const result = await engine.execute('Search for a', {
+        requireTodoWrite: false,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.turns).toBe(2); // tool call + final response
+    });
+  });
+
+  // ===========================================================================
+  // SUB-AGENT TOOLS (spawn_task / task_status)
+  // ===========================================================================
+
+  describe('Sub-Agent Tools', () => {
+    it('should include spawn_task in tool list when taskSpawner is provided', async () => {
+      const mockTaskSpawner = {
+        spawn: vi.fn(async () => ({
+          taskId: 'task_123',
+          success: true,
+          data: 'Sub-agent result',
+          status: 'completed' as const,
+        })),
+        isRunning: vi.fn(() => false),
+        getResult: vi.fn(),
+        getRunningTasks: vi.fn(() => []),
+        cancel: vi.fn(),
+        cancelAll: vi.fn(),
+        depth: 0,
+        maxDepth: 3,
+        maxConcurrent: 5,
+      };
+
+      // LLM calls spawn_task, then produces final response
+      const llm = createMockLLM([
+        {
+          content: '',
+          toolCalls: [{
+            id: 'tc_1',
+            name: 'spawn_task',
+            params: {
+              description: 'Search vault',
+              prompt: 'Find all notes about TypeScript',
+              subagentType: 'explore',
+            },
+          }],
+        },
+        { content: 'Found results via sub-agent' },
+      ]);
+
+      const tools = createMockToolProvider({});
+      const engine = new ConversationEngine({
+        llm,
+        tools,
+        ui: createMockUI(),
+        events: createMockEventEmitter(),
+        taskSpawner: mockTaskSpawner as any,
+      });
+
+      const result = await engine.execute('Search for TypeScript notes', {
+        requireTodoWrite: false,
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockTaskSpawner.spawn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          description: 'Search vault',
+          prompt: 'Find all notes about TypeScript',
+          subagentType: 'explore',
+        })
+      );
+    });
+
+    it('should NOT include spawn_task when no taskSpawner provided', async () => {
+      const llm = createMockLLM([
+        { content: 'No spawn_task available' },
+      ]);
+
+      const tools = createMockToolProvider({});
+
+      // Capture what tools are sent to the LLM
+      const originalChat = llm.chat;
+      let sentToolNames: string[] = [];
+      llm.chat = vi.fn(async (messages, options) => {
+        if (options?.tools) {
+          sentToolNames = options.tools.map((t: any) => t.name || t.id);
+        }
+        return originalChat(messages, options);
+      });
+
+      const engine = new ConversationEngine({
+        llm,
+        tools,
+        ui: createMockUI(),
+        events: createMockEventEmitter(),
+        // No taskSpawner
+      });
+
+      await engine.execute('Simple question', { requireTodoWrite: false });
+
+      expect(sentToolNames).not.toContain('spawn_task');
+      expect(sentToolNames).not.toContain('task_status');
+    });
+
+    it('should handle spawn_task with runInBackground', async () => {
+      const mockTaskSpawner = {
+        spawn: vi.fn(async () => ({
+          taskId: 'task_bg_1',
+          success: true,
+          status: 'running' as const,
+        })),
+        isRunning: vi.fn(() => true),
+        getResult: vi.fn(async () => ({
+          taskId: 'task_bg_1',
+          success: true,
+          data: 'Background result',
+          status: 'completed' as const,
+        })),
+        getRunningTasks: vi.fn(() => []),
+        cancel: vi.fn(),
+        cancelAll: vi.fn(),
+        depth: 0,
+        maxDepth: 3,
+        maxConcurrent: 5,
+      };
+
+      const llm = createMockLLM([
+        {
+          content: '',
+          toolCalls: [{
+            id: 'tc_1',
+            name: 'spawn_task',
+            params: {
+              description: 'Background task',
+              prompt: 'Run tests',
+              subagentType: 'execute',
+              runInBackground: true,
+            },
+          }],
+        },
+        { content: 'Task spawned in background' },
+      ]);
+
+      const engine = new ConversationEngine({
+        llm,
+        tools: createMockToolProvider({}),
+        ui: createMockUI(),
+        events: createMockEventEmitter(),
+        taskSpawner: mockTaskSpawner as any,
+      });
+
+      const result = await engine.execute('Run tests in background', {
+        requireTodoWrite: false,
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockTaskSpawner.spawn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runInBackground: true,
+        })
+      );
+    });
+  });
+
 });
 

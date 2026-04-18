@@ -398,6 +398,8 @@ interface CompressionConfig {
     charsPerToken?: number;
     /** Maximum tokens for summary generation (default: 1000) */
     summaryMaxTokens?: number;
+    /** Token budget for dynamic tail protection (Phase 3 — overrides preserveRecentTurns when set) */
+    tailBudgetTokens?: number;
 }
 /**
  * AIOS events
@@ -1632,6 +1634,83 @@ declare global {
 }
 
 /**
+ * MemoryFlushHook — Flush-Before-Discard Interface
+ *
+ * Interface and trigger logic for saving durable memories before context
+ * compaction discards old messages. Phase 3 provides the interface and
+ * no-op default; Phase 4 provides the real implementation that calls
+ * memory tools and writes to memory/YYYY-MM-DD.md.
+ *
+ * Trigger conditions (adapted from OpenClaw):
+ * - Context tokens near budget (within softThresholdTokens)
+ * - Transcript exceeds forceFlushTranscriptBytes
+ * - Not already flushed for this compaction cycle
+ *
+ * Phase 3, Step 6 of Agentic Harness Implementation.
+ */
+
+interface MemoryFlushConfig {
+    /** Enable memory flush before compaction (default: true) */
+    enabled: boolean;
+    /** Flush when tokens are within this many of the budget (default: 4000) */
+    softThresholdTokens: number;
+    /** Force flush when transcript exceeds this byte count (default: 2MB) */
+    forceFlushTranscriptBytes: number;
+}
+interface FlushTriggerParams {
+    /** Estimated tokens currently used */
+    estimatedTokens: number;
+    /** Token budget for the context window */
+    tokenBudget: number;
+    /** Estimated transcript size in bytes */
+    transcriptByteEstimate: number;
+    /** Number of compactions completed so far in this session */
+    compactionCount: number;
+}
+/**
+ * Hook interface for flush-before-discard pattern.
+ * Implementations execute a silent agentic turn to save durable memories
+ * before context compaction discards old messages.
+ */
+interface MemoryFlushHook {
+    /** Check if flush should run before compaction */
+    shouldFlush(params: FlushTriggerParams): boolean;
+    /** Execute flush — returns true if memories were saved */
+    flush(params: {
+        messages: Message[];
+        signal: AbortSignal;
+    }): Promise<boolean>;
+    /** Record that a flush was completed for a compaction cycle (prevents re-triggering) */
+    recordFlush(compactionCount: number): void;
+}
+/**
+ * No-op implementation — always returns false.
+ * Phase 4 replaces this with a real implementation that calls memory tools.
+ */
+declare class NoOpMemoryFlushHook implements MemoryFlushHook {
+    private config;
+    private lastFlushedCompactionCount;
+    constructor(config?: Partial<MemoryFlushConfig>);
+    /**
+     * Check if flush should run before compaction.
+     * Returns true if conditions are met (even in no-op mode, for testing the trigger logic).
+     */
+    shouldFlush(params: FlushTriggerParams): boolean;
+    /**
+     * No-op flush — Phase 4 provides real implementation.
+     */
+    flush(_params: {
+        messages: Message[];
+        signal: AbortSignal;
+    }): Promise<boolean>;
+    /**
+     * Record that a flush was attempted for the given compaction count.
+     * Prevents re-triggering for the same cycle.
+     */
+    recordFlush(compactionCount: number): void;
+}
+
+/**
  * ConversationEngine - Core conversation loop for AIOS
  *
  * Implements a multi-turn conversation pattern inspired by Claude Code.
@@ -1682,6 +1761,8 @@ interface ConversationEngineDeps {
     classifierLlm?: LLMProvider;
     /** Optional TaskSpawner for sub-agent execution (enables spawn_task tool) */
     taskSpawner?: TaskSpawner;
+    /** Optional MemoryFlushHook for flush-before-discard (Phase 4) */
+    memoryFlushHook?: MemoryFlushHook;
 }
 /**
  * ConversationEngine class
@@ -1719,18 +1800,26 @@ declare class ConversationEngine {
     private debugHarness;
     private taskSpawner;
     private baseSystemPrompt;
-    private recentToolSignatures;
-    private lastActiveTodosSnapshot;
-    private staleTodoTurns;
-    private static readonly LOOP_DETECTION_WINDOW;
-    private static readonly STALE_TODO_THRESHOLD;
-    private static readonly STALE_TODO_FORCE_STOP;
+    private loopDetector;
+    private contextPruner;
+    private memoryFlushHook;
+    private compactionCount;
     constructor(deps: ConversationEngineDeps);
     /**
      * Attach a debug harness for structured trace logging and step-mode.
      * When attached, every phase of the conversation loop emits trace entries.
      */
     setDebugHarness(harness: DebugHarness): void;
+    /**
+     * Continue an existing conversation with a new user message.
+     * Appends to existing history instead of resetting.
+     * Uses the same conversationId and preserves all state.
+     */
+    continueConversation(prompt: string, config?: ConversationConfig): Promise<ConversationResult>;
+    /**
+     * Check if this engine has an active conversation (history exists).
+     */
+    hasActiveConversation(): boolean;
     /**
      * Execute a conversation with the given prompt
      */
@@ -1759,16 +1848,6 @@ declare class ConversationEngine {
      * Main conversation loop
      */
     private runLoop;
-    /**
-     * Detect if the conversation is looping — repeating the same tool calls
-     * or making no progress on active todos.
-     *
-     * Returns:
-     * - 'none'       — no loop detected, continue normally
-     * - 'nudge'      — stale todos detected, inject a reminder to change approach
-     * - 'force-stop' — severe loop detected, stop the conversation
-     */
-    private detectLoop;
     /**
      * Execute a single tool call
      */
@@ -1802,23 +1881,12 @@ declare class ConversationEngine {
      * Extracted from the main loop and handleBatchTools to avoid duplication.
      */
     private processToolResult;
-    /**
-     * Format tool result for message history
-     */
-    /**
-     * Format a tool result for the LLM
-     *
-     * Priority:
-     * 1. Structured result (if available) - formatted for better LLM parsing
-     * 2. Observation string (human-readable summary)
-     * 3. JSON data fallback
-     */
-    private formatToolResult;
+    private _deprecated_formatToolResult;
     /**
      * Truncate a formatted tool result if it exceeds the configured max chars.
      * Uses 70/30 head/tail strategy to preserve beginning and end context.
      */
-    private truncateToolResult;
+    private _deprecated_truncateToolResult;
     /**
      * Create a conversation result
      */
@@ -2076,8 +2144,17 @@ declare class PlanManager {
  * into structured bullet points. This prevents the "compress everything at
  * once" cliff and preserves temporal ordering across multiple summaries.
  *
+ * Phase 3 enhancements:
+ * - Iterative summary updates (Hermes pattern): previous summary fed into next compression
+ * - Structured summary template: Goal/Progress/Decisions/Files/Next Steps/Critical Context
+ * - Token-budget tail protection: dynamic tail size based on budget, not fixed message count
+ * - 3-level fallback chain: full → partial (exclude oversized) → metadata-only
+ * - Identifier preservation instructions
+ * - Configurable interval + budget-pressure trigger
+ * - CompactReason tracking for telemetry
+ *
  * History shape after compression:
- *   [system] + [user] + [summary_1] + [summary_2] + ... + [last N turns verbatim]
+ *   [system] + [user] + [summary_1] + [summary_2] + ... + [last N tokens verbatim]
  */
 
 /**
@@ -2094,49 +2171,67 @@ interface CompressionResult {
     summarizedTurns: number;
     /** Whether compression was applied */
     wasCompressed: boolean;
+    /** Why compaction did/didn't happen */
+    reason?: CompactReason;
+    /** The summary text produced (for systemPromptAddition injection) */
+    summary?: string;
 }
+type CompactReason = 'interval' | 'budget_pressure' | 'force' | 'fallback_partial' | 'fallback_metadata' | 'skipped_below_threshold' | 'skipped_disabled';
 declare class ContextCompressor {
     private llm;
     private config;
-    /** Count of unsummarized turns since last compression */
-    private unsummarizedTurnCount;
+    /** Previous compaction summary for iterative updates (Hermes pattern) */
+    private previousSummary;
+    /** Optional token budget for tail protection (from TokenBudgetResolver) */
+    private tailBudgetTokens;
     constructor(llm: LLMProvider, config?: CompressionConfig);
+    /**
+     * Set the tail budget from TokenBudgetResolver.
+     * When set, overrides preserveRecentTurns with dynamic token-based protection.
+     */
+    setTailBudget(messageWindowBudget: number): void;
     /**
      * Compress conversation history using rolling summarization.
      *
-     * Called every turn. Checks two conditions:
+     * Checks two conditions:
      * 1. Have N new turns accumulated since last compression? → Summarize them
      * 2. Are we over the token budget? → Force-compress oldest unsummarized block
      */
     compress(history: Message[], systemPrompt?: string): Promise<CompressionResult>;
     /**
-     * Parse history into system messages, initial user message, and turns.
-     * Recognizes previous summary messages (prefixed with [Summary of turns ...]).
+     * Get the last compaction summary (for systemPromptAddition injection).
      */
-    private parseHistory;
+    getLastSummary(): string | null;
     /**
-     * Generate a structured bullet-point summary of conversation turns
+     * Select tail turns to preserve.
+     * Uses token-budget approach (Hermes pattern) when tailBudgetTokens is set,
+     * otherwise falls back to fixed turn count.
+     */
+    private selectTailTurns;
+    /**
+     * Summarize turns with 3-level fallback chain:
+     * 1. Full: Structured summary of all turns (with previous summary for continuity)
+     * 2. Partial: Exclude oversized turns (>50% of budget)
+     * 3. Metadata-only: Basic metadata about what happened
+     */
+    private summarizeWithFallback;
+    /**
+     * Generate structured summary of conversation turns.
+     * Uses Hermes iterative pattern: previous summary fed into prompt for continuity.
      */
     private summarizeTurns;
     /**
-     * Return no-compression result
+     * Metadata-only fallback when LLM summarization fails entirely.
      */
+    private metadataFallback;
+    /**
+     * Parse history into system messages, initial user message, and turns.
+     */
+    private parseHistory;
     private noCompression;
-    /**
-     * Estimate token count for a list of messages
-     */
     private estimateTokens;
-    /**
-     * Estimate token count for a string
-     */
     private estimateMessageTokens;
-    /**
-     * Update configuration
-     */
     updateConfig(config: Partial<CompressionConfig>): void;
-    /**
-     * Get current configuration
-     */
     getConfig(): Required<CompressionConfig>;
 }
 
@@ -2540,6 +2635,8 @@ interface AIOSProviders {
     }) => Promise<MemoryContext>;
     /** Build enhanced system prompt with memory context (optional) */
     buildEnhancedSystemPrompt?: (basePrompt: string, memoryContext: MemoryContext, userGoal: string) => Promise<string>;
+    /** Memory flush hook for flush-before-discard (Phase 4) */
+    getMemoryFlushHook?: () => MemoryFlushHook;
 }
 /**
  * Set the providers for AIOS
@@ -2594,6 +2691,11 @@ declare class AIOSService {
      * Execute a conversation with the given prompt
      */
     execute(prompt: string, config?: ConversationConfig): Promise<ConversationResult>;
+    /**
+     * Reset the conversation engine so the next execute() starts fresh.
+     * Call this when the user clicks "New Chat" or equivalent.
+     */
+    newConversation(): void;
     /**
      * Cancel the current conversation
      */
@@ -2726,4 +2828,4 @@ declare function mkdir(path: string, options?: {
 }): Promise<void>;
 declare function exists(path: string): Promise<boolean>;
 
-export { type AIOSBackend, type AIOSConfig, type AIOSEvents, type AIOSFilesystem, type AIOSProviders, AIOSService, type Agent, type AgentConfig, type AgentFactory, type ChatOptions, type CompositeToolProvider, type CompressionConfig, ContextCompressor, type ConversationConfig, ConversationEngine, type ConversationEngineDeps, type ConversationResult, type ConversationStatus, ConversationStore, type CostLevel, type DebugConsoleAPI, DebugHarness, type DecisionLog, DecisionLogger, type DecisionType, type EventEmitter, type EventHandler, type EventSubscription, type IntentClassificationResult, type IntentSuggestedAction, type InteractionRequest, type JSONSchemaProperty, type LLMCapabilities, type LLMProvider, type LLMProviderFactory, type LLMResponse, type LogLevel, type Logger, type MemoryContext, type Message, type MessageRole, type MetadataCategory, type ModelProvider, type ModelTier, type NamespacedStateStore, type NotificationType, type PlanApprovalStatus, PlanManager, type PlanState, type ProviderType, type Question, type QuestionOption, type ReflectionResultPayload, type RetryConfig$1 as RetryConfig, type RetryOptions, type RetryResult, type SideEffects, type StateChangeCallback, type StateStore, type StateSubscription, type StructuredToolResult, type SubAgentType, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, type TaskComplexityLevel, type TaskParams, type TaskResult, TaskSpawner, type Todo$1 as Todo, type TodoChangeCallback, TodoManager, type TodoResult, type TodoStatus$1 as TodoStatus, type Tool, type ToolCall, type ToolCategory, type ToolContext, type ToolDefinition, type ToolFollowUpAction, type ToolMetadata, type ToolParameters, type ToolProvider, type ToolRegistry, type ToolRegistryProvider, type ToolResult$1 as ToolResult, ToolRetryPolicy, type ToolUserInterface, type TraceEntry, type TraceIndex, type TracePhase, type UserInterface, type UserInterfaceFactory, VercelAILLMProvider, type VercelAILLMProviderConfig, VerificationEngine, absorbPendingConfig, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getToolMetadata, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
+export { type AIOSBackend, type AIOSConfig, type AIOSEvents, type AIOSFilesystem, type AIOSProviders, AIOSService, type Agent, type AgentConfig, type AgentFactory, type ChatOptions, type CompositeToolProvider, type CompressionConfig, ContextCompressor, type ConversationConfig, ConversationEngine, type ConversationEngineDeps, type ConversationResult, type ConversationStatus, ConversationStore, type CostLevel, type DebugConsoleAPI, DebugHarness, type DecisionLog, DecisionLogger, type DecisionType, type EventEmitter, type EventHandler, type EventSubscription, type FlushTriggerParams, type IntentClassificationResult, type IntentSuggestedAction, type InteractionRequest, type JSONSchemaProperty, type LLMCapabilities, type LLMProvider, type LLMProviderFactory, type LLMResponse, type LogLevel, type Logger, type MemoryContext, type MemoryFlushConfig, type MemoryFlushHook, type Message, type MessageRole, type MetadataCategory, type ModelProvider, type ModelTier, type NamespacedStateStore, NoOpMemoryFlushHook, type NotificationType, type PlanApprovalStatus, PlanManager, type PlanState, type ProviderType, type Question, type QuestionOption, type ReflectionResultPayload, type RetryConfig$1 as RetryConfig, type RetryOptions, type RetryResult, type SideEffects, type StateChangeCallback, type StateStore, type StateSubscription, type StructuredToolResult, type SubAgentType, TODOWRITE_EXEMPT_TOOLS, TOOL_METADATA, type TaskComplexityLevel, type TaskParams, type TaskResult, TaskSpawner, type Todo$1 as Todo, type TodoChangeCallback, TodoManager, type TodoResult, type TodoStatus$1 as TodoStatus, type Tool, type ToolCall, type ToolCategory, type ToolContext, type ToolDefinition, type ToolFollowUpAction, type ToolMetadata, type ToolParameters, type ToolProvider, type ToolRegistry, type ToolRegistryProvider, type ToolResult$1 as ToolResult, ToolRetryPolicy, type ToolUserInterface, type TraceEntry, type TraceIndex, type TracePhase, type UserInterface, type UserInterfaceFactory, VercelAILLMProvider, type VercelAILLMProviderConfig, VerificationEngine, absorbPendingConfig, conversationStore, createAIOSService, createDefaultLLMProvider, createLogger, createMemoryFilesystem, exists, filterActionTools, filterExemptTools, getAIOSService, getBackend, getFilesystem, getLogLevel, getProviders, getToolMetadata, installDebugStub, invoke, isToolExemptFromTodoWrite, mkdir, partitionToolCalls, readTextFile, resetAIOSService, setBackend, setFilesystem, setLogLevel, setModelProvider, setProviders, setToolRegistryProvider, toolAllowsParallel, toolRequiresConfirmation, toolRequiresTodoWrite, writeTextFile };
